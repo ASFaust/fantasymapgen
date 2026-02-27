@@ -1,6 +1,8 @@
 import numpy as np
 import matplotlib
 
+from sim.biomes import classify_biomes, BIOME_COLORS
+
 SEA_LEVEL = 0.2
 
 
@@ -34,11 +36,11 @@ class LayerCompositor:
     def render_base(
         self,
         base_layer: str = "heightmap",
-        curve_editor=None,
         cmap_name: str = "terrain",
         clip_sea: bool = False,
         precip_scale_mm: float = 2000.0,
         ice_overlay: bool = False,
+        alpine_overlay: bool = False,
     ) -> np.ndarray:
         """Return H×W×3 uint8 for the selected base layer."""
         if self.heightmap is None:
@@ -48,8 +50,13 @@ class LayerCompositor:
             img = self._render_temperature()
         elif base_layer == "precipitation":
             img = self._render_precipitation(precip_scale_mm)
+        elif base_layer == "biomes":
+            img = self._render_biomes(precip_scale_mm)
         else:
-            img = self._render_heightmap(curve_editor, cmap_name, clip_sea)
+            img = self._render_heightmap(cmap_name, clip_sea)
+
+        if alpine_overlay and self.weather_sim is not None:
+            img = self._apply_alpine_overlay(img)
 
         if ice_overlay and self.weather_sim is not None:
             img = self._apply_ice_overlay(img)
@@ -60,16 +67,8 @@ class LayerCompositor:
     # Base layer renderers
     # ------------------------------------------------------------------
 
-    def _render_heightmap(self, curve_editor, cmap_name: str, clip_sea: bool) -> np.ndarray:
+    def _render_heightmap(self, cmap_name: str, clip_sea: bool) -> np.ndarray:
         arr = self.heightmap.copy()
-
-        # Curve remap on land only
-        land_mask = arr > SEA_LEVEL
-        if land_mask.any() and curve_editor is not None:
-            land = arr[land_mask]
-            land_norm = (land - SEA_LEVEL) / max(1.0 - SEA_LEVEL, 1e-6)
-            land_remapped = curve_editor.apply(land_norm)
-            arr[land_mask] = SEA_LEVEL + land_remapped * (1.0 - SEA_LEVEL)
 
         if clip_sea:
             arr[arr <= SEA_LEVEL] = 0.0
@@ -79,7 +78,7 @@ class LayerCompositor:
 
     def _render_temperature(self) -> np.ndarray:
         if self.weather_sim is None:
-            return self._render_heightmap(None, "Greys_r", False)
+            return self._render_heightmap("Greys_r", False)
 
         t = self.weather_sim.sim_temperature
         # Normalise −30 … +40 °C to [0, 1]; blue=cold, red=hot
@@ -88,13 +87,13 @@ class LayerCompositor:
         return (cmap(t_norm)[:, :, :3] * 255).astype(np.uint8)
 
     def _render_precipitation(self, precip_scale_mm: float = 2000.0) -> np.ndarray:
-        if self.weather_sim is None:
-            return self._render_heightmap(None, "Greys_r", False)
+        if self.weather_sim is None or self.weather_sim.sim_precipitation is None:
+            return self._render_heightmap("Greys_r", False)
 
-        m = self.weather_sim.sim_moisture  # [0, 1]
-        # Convert to mm/year; clamp to [0, scale] for colour mapping
-        precip_mm = np.clip(m * precip_scale_mm, 0.0, precip_scale_mm)
-        t = precip_mm / max(precip_scale_mm, 1.0)  # normalised [0, 1]
+        m = self.weather_sim.sim_precipitation  # [0, 1], land max = 1.0
+        # Log-scale the [0, 1] ratio to expand dry-to-moderate variation
+        k = 10.0
+        t = np.log1p(np.clip(m, 0.0, 1.0) * k) / np.log1p(k)
 
         land_mask = self.heightmap > SEA_LEVEL
 
@@ -108,16 +107,46 @@ class LayerCompositor:
 
         return np.clip(rgb, 0, 255).astype(np.uint8)
 
-    def _apply_ice_overlay(self, img: np.ndarray) -> np.ndarray:
-        """Blend a pale blue-white tint where temperature is at or below freezing.
+    def _render_biomes(self, precip_scale_mm: float = 2000.0) -> np.ndarray:
+        ws = self.weather_sim
+        if ws is None or ws.sim_precipitation is None:
+            return self._render_heightmap("Greys_r", False)
 
-        Alpha ramp: fully opaque at −30 °C and below, transparent at +2 °C and above.
-        Covers both sea ice (ocean) and snow/glaciers (land).
+        ocean_mask = self.heightmap <= SEA_LEVEL
+        biome_ids = classify_biomes(
+            temperature=ws.sim_temperature,
+            precipitation_mm=ws.sim_precipitation * precip_scale_mm,
+            elevation_km=ws.elevation_km,
+            ocean_mask=ocean_mask,
+        )
+        return BIOME_COLORS[biome_ids]
+
+    def _apply_alpine_overlay(self, img: np.ndarray) -> np.ndarray:
+        """Solid grey tint where elevation is above 2.5 km."""
+        mask = self.weather_sim.elevation_km >= 2.5
+        result = img.copy()
+        result[mask] = [0x9E, 0x9E, 0x9E]
+        return result
+
+    def _apply_ice_overlay(self, img: np.ndarray) -> np.ndarray:
+        """Blend a pale blue-white tint over cold regions.
+
+        Alpha ramp with a visible edge:
+          T >= -2 °C  → no ice  (alpha = 0)
+          T  = -2 °C  → alpha = 0.5  (sharp visible boundary)
+          T  = -15 °C → alpha = 1.0  (fully opaque pack ice)
         """
         t = self.weather_sim.sim_temperature  # °C, (H, W)
 
-        ice_mask = t <= 0.0  # True where frozen
+        # Linear ramp from 0.5 at -2°C to 1.0 at -15°C
+        alpha = np.where(
+            t >= -2.0,
+            0.0,
+            np.clip(0.5 + 0.5 * (-2.0 - t) / 13.0, 0.5, 1.0),
+        )
 
-        result = img.copy()
-        result[ice_mask] = [210, 235, 255]  # pale blue-white
-        return result
+        ice_color = np.array([210, 235, 255], dtype=np.float32)
+        result = img.astype(np.float32)
+        a = alpha[:, :, np.newaxis]
+        result = (1.0 - a) * result + a * ice_color
+        return np.clip(result, 0, 255).astype(np.uint8)

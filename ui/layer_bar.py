@@ -21,7 +21,7 @@ class LayerBar(QWidget):
     overlay_changed = pyqtSignal(str, bool)
 
     CMAPS = ["terrain", "Greys_r", "gist_earth"]
-    _BASE_IDS = ["heightmap", "temperature", "precipitation"]
+    _BASE_IDS = ["heightmap", "temperature", "precipitation", "biomes"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -39,8 +39,10 @@ class LayerBar(QWidget):
         self._heightmap_btn.setChecked(True)
         self._temp_btn = QRadioButton("Temperature")
         self._precip_btn = QRadioButton("Precipitation")
+        self._biome_btn = QRadioButton("Biomes")
+        self._biome_btn.setEnabled(False)
 
-        for i, btn in enumerate([self._heightmap_btn, self._temp_btn, self._precip_btn]):
+        for i, btn in enumerate([self._heightmap_btn, self._temp_btn, self._precip_btn, self._biome_btn]):
             self._btn_group.addButton(btn, i)
             base_layout.addWidget(btn)
 
@@ -63,6 +65,14 @@ class LayerBar(QWidget):
         self._ice_check.setEnabled(False)  # enabled once weather sim runs
         overlay_layout.addWidget(self._ice_check)
 
+        self._alpine_check = QCheckBox("Alpine")
+        self._alpine_check.setEnabled(False)
+        overlay_layout.addWidget(self._alpine_check)
+
+        self._contour_check = QCheckBox("Height Lines")
+        self._contour_check.setEnabled(False)
+        overlay_layout.addWidget(self._contour_check)
+
         layout.addWidget(overlay_group)
         layout.addStretch()
 
@@ -74,6 +84,12 @@ class LayerBar(QWidget):
         )
         self._ice_check.stateChanged.connect(
             lambda s: self.overlay_changed.emit("ice", bool(s))
+        )
+        self._alpine_check.stateChanged.connect(
+            lambda s: self.overlay_changed.emit("alpine", bool(s))
+        )
+        self._contour_check.stateChanged.connect(
+            lambda s: self.overlay_changed.emit("contour", bool(s))
         )
 
     # ------------------------------------------------------------------
@@ -103,6 +119,24 @@ class LayerBar(QWidget):
         self._ice_check.setEnabled(enabled)
         if not enabled:
             self._ice_check.setChecked(False)
+
+    def set_alpine_enabled(self, enabled: bool) -> None:
+        """Enable/disable the alpine checkbox; unchecks it when disabling."""
+        self._alpine_check.setEnabled(enabled)
+        if not enabled:
+            self._alpine_check.setChecked(False)
+
+    def set_biomes_enabled(self, enabled: bool) -> None:
+        """Enable/disable the Biomes radio button."""
+        self._biome_btn.setEnabled(enabled)
+        if not enabled and self._biome_btn.isChecked():
+            self._heightmap_btn.setChecked(True)
+
+    def set_contour_enabled(self, enabled: bool) -> None:
+        """Enable/disable the Height Lines checkbox; unchecks it when disabling."""
+        self._contour_check.setEnabled(enabled)
+        if not enabled:
+            self._contour_check.setChecked(False)
 
     # ------------------------------------------------------------------
     # Internal slots

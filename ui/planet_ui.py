@@ -6,20 +6,52 @@ _DEFAULT_PRESET = Path(__file__).parent.parent / "default_preset.yaml"
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QSlider, QVBoxLayout, QHBoxLayout,
-    QSpinBox, QCheckBox, QPushButton,
+    QSpinBox, QCheckBox, QPushButton, QProgressBar,
     QScrollArea, QSizePolicy, QFileDialog, QComboBox, QTabWidget,
     QStackedWidget, QButtonGroup,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 from gen.iq_warp import create_planet_heightmap
 from .utils import float_slider, slider_value
 from .curve_editor import CurveEditor
 from .gl_widget import PlanetGLWidget
 from sim.weather_sim import WeatherSim
+from sim.biomes import classify_biomes, BIOME_NAMES
 from render.compositor import LayerCompositor
 from .map_view_widget import MapViewWidget
 from .layer_bar import LayerBar
+
+
+class WeatherWorker(QThread):
+    """Constructs WeatherSim and runs moisture advection in a background thread."""
+    progress = pyqtSignal(int, int)   # (step, n_steps)
+    finished = pyqtSignal(object)     # WeatherSim instance
+
+    def __init__(self, params: dict, parent=None):
+        super().__init__(parent)
+        self._params = params
+
+    def run(self):
+        p = self._params
+        ws = WeatherSim(
+            p['heightmap'], p['lat'], p['lon'],
+            earth_radius_factor=p['earth_radius_factor'],
+            mountain_height_km=p['mountain_height_km'],
+            sim_resolution=p['sim_resolution'],
+            sea_level=0.2,
+            polar_temp=p['polar_temp'],
+            equatorial_temp=p['equatorial_temp'],
+            lapse_rate=p['lapse_rate'],
+            sim_time_hours=p['sim_time_hours'],
+            diffusion_km2_hr=p['diffusion_km2_hr'],
+            orographic_factor=p['orographic_factor'],
+            land_penetration_km=p['land_penetration_km'],
+            seed=p['seed'],
+            ocean_temp_noise=p['ocean_temp_noise'],
+        )
+        ws.run_moisture(progress_cb=lambda s, n: self.progress.emit(s, n))
+        self.finished.emit(ws)
 
 
 class PlanetUI(QWidget):
@@ -32,6 +64,10 @@ class PlanetUI(QWidget):
 
         self._compositor = LayerCompositor()
         self._ice_overlay_visible = False
+        self._alpine_overlay_visible = False
+        self._contour_overlay_visible = False
+        self._weather_running = False
+        self._weather_rerun_pending = False
 
         main_layout = QHBoxLayout(self)
 
@@ -83,6 +119,7 @@ class PlanetUI(QWidget):
         # Stacked viewport
         self._view_stack = QStackedWidget()
         self.map_view = MapViewWidget()
+        self.map_view.hover.connect(self._on_hover)
         self._view_stack.addWidget(self.map_view)      # index 0 = 2D
         self.gl_widget = PlanetGLWidget()
         self._view_stack.addWidget(self.gl_widget)     # index 1 = 3D
@@ -109,6 +146,14 @@ class PlanetUI(QWidget):
         preset_bar_layout.addWidget(set_default_btn)
         preset_bar_layout.addWidget(reset_default_btn)
         preset_bar_layout.addStretch()
+
+        self._hover_label = QLabel("")
+        self._hover_label.setStyleSheet(
+            "color: #ccc; font-size: 11px; font-family: monospace;"
+        )
+        preset_bar_layout.addWidget(self._hover_label)
+
+        preset_bar_layout.addStretch()
         preset_bar_layout.addWidget(load_preset_btn)
         preset_bar_layout.addWidget(save_preset_btn)
         right_layout.addWidget(preset_bar)
@@ -134,6 +179,61 @@ class PlanetUI(QWidget):
         elif name == "ice":
             self._ice_overlay_visible = visible
             self.render()
+        elif name == "alpine":
+            self._alpine_overlay_visible = visible
+            self.render()
+        elif name == "contour":
+            self._contour_overlay_visible = visible
+            self.map_view.set_contour_visible(visible)
+
+    def _on_hover(self, row_frac: float, col_frac: float):
+        if row_frac < 0 or not hasattr(self, 'heightmap'):
+            self._hover_label.setText("")
+            return
+
+        H, W = self.heightmap.shape
+        r = min(int(row_frac * H), H - 1)
+        c = min(int(col_frac * W), W - 1)
+
+        # South is up (row 0 = south pole), so lat from _lat grid is inverted
+        lat_deg = float(np.degrees(self._lat[r, c]))
+        lon_deg = float(np.degrees(self._lon[r, c]))
+        ns = "S" if lat_deg < 0 else "N"
+        ew = "W" if lon_deg < 0 else "E"
+
+        elev_raw = float(self.heightmap[r, c])
+        sea_level = 0.2
+        ws = self._compositor.weather_sim
+
+        parts = [f"{abs(lat_deg):.1f}\u00b0{ns} {abs(lon_deg):.1f}\u00b0{ew}"]
+
+        if ws is not None:
+            elev_km = float(ws.elevation_km[r, c])
+            if elev_raw < sea_level:
+                parts.append(f"ocean")
+            else:
+                parts.append(f"elev {elev_km:.2f} km")
+
+            temp = float(ws.sim_temperature[r, c])
+            parts.append(f"{temp:.1f} \u00b0C")
+
+            shore = float(ws.sim_shore_distance_km[r, c])
+            parts.append(f"shore {shore:.0f} km")
+
+            if ws.sim_precipitation is not None:
+                precip_scale = slider_value(self.ws_precip_scale)
+                precip_mm = float(ws.sim_precipitation[r, c]) * precip_scale
+                parts.append(f"precip {precip_mm:.0f} mm/yr")
+
+                biome_id = classify_biomes(
+                    temperature=np.array([[temp]]),
+                    precipitation_mm=np.array([[precip_mm]]),
+                    elevation_km=np.array([[elev_km]]),
+                    ocean_mask=np.array([[elev_raw < sea_level]]),
+                )[0, 0]
+                parts.append(BIOME_NAMES[biome_id])
+
+        self._hover_label.setText("  \u2502  ".join(parts))
 
     # ==========================================================
     # Auto Regen Connector
@@ -221,7 +321,7 @@ class PlanetUI(QWidget):
         self.controls_layout.addWidget(curve_hint)
 
         self.curve_editor = CurveEditor()
-        self.curve_editor.curveChanged.connect(self.render)
+        self.curve_editor.curveChanged.connect(self._apply_curve)
         self.controls_layout.addWidget(self.curve_editor)
 
         reset_curve_btn = QPushButton("Reset Curve")
@@ -245,6 +345,17 @@ class PlanetUI(QWidget):
         calc_btn = QPushButton("Calculate Weather")
         calc_btn.clicked.connect(self._calculate_weather)
         self.weather_layout.addWidget(calc_btn)
+        self._calc_btn = calc_btn
+
+        self._weather_progress = QProgressBar()
+        self._weather_progress.setRange(0, 100)
+        self._weather_progress.setTextVisible(True)
+        self._weather_progress.setVisible(False)
+        self.weather_layout.addWidget(self._weather_progress)
+
+        self._weather_status_label = QLabel("")
+        self._weather_status_label.setStyleSheet("color: #aaa; font-size: 10px;")
+        self.weather_layout.addWidget(self._weather_status_label)
 
         def _add(name, min_val, max_val, default, step):
             label = QLabel(f"{name}: {default}")
@@ -260,29 +371,41 @@ class PlanetUI(QWidget):
 
         self.earth_radius_factor  = _add("earth_radius_factor",  0.0,  2.0,   1.0,  0.01)
         self.mountain_height_km   = _add("mountain_height_km",   0.0, 20.0,   8.0,  0.1)
-        self.sim_resolution       = _add("sim_resolution",       0.1,  1.0,   1.0,  0.01)
+        sim_res_label = QLabel("Sim Resolution")
+        self.sim_resolution_combo = QComboBox()
+        for res in [128, 256, 512, 1024]:
+            self.sim_resolution_combo.addItem(f"{res}\u00d7{res}", res)
+        self.sim_resolution_combo.setCurrentIndex(1)  # default 256
+        self.sim_resolution_combo.currentIndexChanged.connect(
+            lambda: self._update_weather_sim()
+        )
+        self.weather_layout.addWidget(sim_res_label)
+        self.weather_layout.addWidget(self.sim_resolution_combo)
         self.ws_polar_temp        = _add("polar_temp (°C)",     -60.0, 20.0, -25.0,  0.5)
         self.ws_equatorial_temp   = _add("equatorial_temp (°C)",  0.0, 60.0,  27.0,  0.5)
-        self.ws_shore_decay_km    = _add("shore_decay_km",      50.0, 3000.0, 600.0, 10.0)
         self.ws_lapse_rate        = _add("lapse_rate (°C/km)",   0.0, 15.0,   6.5,  0.1)
-        self.ws_onshore_strength  = _add("onshore_strength",     0.0,  1.0,   0.4,  0.01)
-        self.ws_orographic_strength = _add("orographic_strength", 0.0, 1.0,  0.5,  0.01)
 
-        n_steps_label = QLabel("orographic_n_steps: 20")
-        self.ws_orographic_n_steps = float_slider(1.0, 100.0, 1.0)
-        self.ws_orographic_n_steps.setValue(int((20.0 - 1.0) / 1.0))
-        self.ws_orographic_n_steps.valueChanged.connect(
-            lambda: n_steps_label.setText(
-                f"orographic_n_steps: {int(_sv(self.ws_orographic_n_steps))}"
+        self.ws_sim_time_hours      = _add("sim_time (hours)",    100.0, 2000.0, 500.0, 50.0)
+        self.ws_diffusion_km2_hr    = _add("diffusion (km²/hr)",    0.0,  500.0, 100.0,  5.0)
+        self.ws_orographic_factor   = _add("orographic_factor",     0.0,    5.0,   0.5,  0.01)
+        self.ws_land_penetration_km = _add("land_penetration (km)",100.0,10000.0,2000.0, 50.0)
+
+        # Ocean temperature noise — breaks zonal symmetry of ice caps
+        ocean_noise_label = QLabel("ocean_temp_noise (°C): 4.0")
+        self.ws_ocean_temp_noise = float_slider(0.0, 10.0, 0.5)
+        self.ws_ocean_temp_noise.setValue(int((4.0 - 0.0) / 0.5))
+        self.ws_ocean_temp_noise.valueChanged.connect(
+            lambda: ocean_noise_label.setText(
+                f"ocean_temp_noise (°C): {_sv(self.ws_ocean_temp_noise):.1f}"
             )
         )
-        self.ws_orographic_n_steps.sliderReleased.connect(self._update_weather_sim)
-        self.weather_layout.addWidget(n_steps_label)
-        self.weather_layout.addWidget(self.ws_orographic_n_steps)
+        self.ws_ocean_temp_noise.sliderReleased.connect(self._update_weather_sim)
+        self.weather_layout.addWidget(ocean_noise_label)
+        self.weather_layout.addWidget(self.ws_ocean_temp_noise)
 
         # Precipitation scale — render-only, no need to re-run sim
         precip_label = QLabel("precip_scale (mm/yr): 2000")
-        self.ws_precip_scale = float_slider(0.0, 5000.0, 10.0)
+        self.ws_precip_scale = float_slider(0.0, 20000.0, 10.0)
         self.ws_precip_scale.setValue(int((2000.0 - 0.0) / 10.0))
         self.ws_precip_scale.valueChanged.connect(
             lambda: precip_label.setText(
@@ -304,7 +427,7 @@ class PlanetUI(QWidget):
         self.generate()
 
     def generate(self):
-        self.heightmap, self._lat, self._lon = create_planet_heightmap(
+        self._raw_heightmap, self._lat, self._lon = create_planet_heightmap(
             size=self.size.value(),
             seed=self.seed.value(),
             octaves=self.octaves.value(),
@@ -322,44 +445,131 @@ class PlanetUI(QWidget):
             backside_sharpness=slider_value(self.backside_sharpness),
             seam_lon=0.0,
         )
-        self._compositor.set_heightmap(self.heightmap, self._lat, self._lon)
         self._weather_calculated = False
-        self._compositor.set_weather_sim(None)
-        self.map_view.clear_wind()
-        self.layer_bar.set_wind_enabled(False)
-        self.layer_bar.set_ice_enabled(False)
         self._ice_overlay_visible = False
-        self.render()
+        self._apply_curve()
+
+    def _apply_curve(self):
+        """Apply the height remap curve to the raw heightmap and update downstream."""
+        if not hasattr(self, '_raw_heightmap'):
+            return
+        sea_level = 0.2
+        arr = self._raw_heightmap.copy()
+        land_mask = arr > sea_level
+        if land_mask.any():
+            land = arr[land_mask]
+            land_norm = (land - sea_level) / max(1.0 - sea_level, 1e-6)
+            land_remapped = self.curve_editor.apply(land_norm)
+            arr[land_mask] = sea_level + land_remapped * (1.0 - sea_level)
+        self.heightmap = arr
+        self.map_view.set_contour_data(self.heightmap)
+        self.layer_bar.set_contour_enabled(True)
+        self._compositor.set_heightmap(self.heightmap, self._lat, self._lon)
+        self._update_weather_sim()
 
     def _calculate_weather(self):
         self._weather_calculated = True
-        self._update_weather_sim()
+        self._run_weather_worker()
 
     def _update_weather_sim(self):
-        if not hasattr(self, 'heightmap') or not self._weather_calculated:
+        if not hasattr(self, 'heightmap'):
             return
 
+        if self._weather_calculated:
+            # Full path (includes moisture) — run in background thread.
+            self._run_weather_worker()
+            return
+
+        # Fast path: base weather only (no moisture), stays on main thread.
         ws = WeatherSim(
             self.heightmap,
             self._lat,
             self._lon,
             earth_radius_factor=slider_value(self.earth_radius_factor),
             mountain_height_km=slider_value(self.mountain_height_km),
-            sim_resolution=slider_value(self.sim_resolution),
+            sim_resolution=self.sim_resolution_combo.currentData(),
             sea_level=0.2,
             polar_temp=slider_value(self.ws_polar_temp),
             equatorial_temp=slider_value(self.ws_equatorial_temp),
-            shore_decay_km=slider_value(self.ws_shore_decay_km),
             lapse_rate=slider_value(self.ws_lapse_rate),
-            onshore_strength=slider_value(self.ws_onshore_strength),
-            orographic_strength=slider_value(self.ws_orographic_strength),
-            orographic_n_steps=int(slider_value(self.ws_orographic_n_steps)),
+            sim_time_hours=slider_value(self.ws_sim_time_hours),
+            diffusion_km2_hr=slider_value(self.ws_diffusion_km2_hr),
+            orographic_factor=slider_value(self.ws_orographic_factor),
+            land_penetration_km=slider_value(self.ws_land_penetration_km),
+            seed=self.seed.value(),
+            ocean_temp_noise=slider_value(self.ws_ocean_temp_noise),
         )
         self._compositor.set_weather_sim(ws)
         self.map_view.set_wind_data(ws.sim_wind_u, ws.sim_wind_v, ws.sim_wind_speed)
         self.layer_bar.set_wind_enabled(True)
-        self.layer_bar.set_ice_enabled(True)
+        self.layer_bar.set_alpine_enabled(True)
+        self.layer_bar.set_ice_enabled(False)
+        self.layer_bar.set_biomes_enabled(False)
         self.render()
+
+    def _run_weather_worker(self):
+        """Snapshot current UI params and launch WeatherWorker in a background thread."""
+        if self._weather_running:
+            self._weather_rerun_pending = True
+            return
+
+        self._weather_running = True
+        self._weather_rerun_pending = False
+
+        params = {
+            'heightmap':          self.heightmap.copy(),
+            'lat':                self._lat.copy(),
+            'lon':                self._lon.copy(),
+            'earth_radius_factor':  slider_value(self.earth_radius_factor),
+            'mountain_height_km':   slider_value(self.mountain_height_km),
+            'sim_resolution':       self.sim_resolution_combo.currentData(),
+            'polar_temp':           slider_value(self.ws_polar_temp),
+            'equatorial_temp':      slider_value(self.ws_equatorial_temp),
+            'lapse_rate':           slider_value(self.ws_lapse_rate),
+            'sim_time_hours':       slider_value(self.ws_sim_time_hours),
+            'diffusion_km2_hr':     slider_value(self.ws_diffusion_km2_hr),
+            'orographic_factor':    slider_value(self.ws_orographic_factor),
+            'land_penetration_km':  slider_value(self.ws_land_penetration_km),
+            'seed':                 self.seed.value(),
+            'ocean_temp_noise':     slider_value(self.ws_ocean_temp_noise),
+        }
+
+        self._weather_worker = WeatherWorker(params, self)
+        self._weather_worker.progress.connect(self._on_weather_progress)
+        self._weather_worker.finished.connect(self._on_weather_finished)
+        self._calc_btn.setEnabled(False)
+        self._weather_progress.setValue(0)
+        self._weather_progress.setVisible(True)
+        self._weather_status_label.setText("Calculating…")
+        self._weather_worker.start()
+
+    def _on_weather_progress(self, step: int, n_steps: int):
+        pct = int(100 * step / max(n_steps, 1))
+        self._weather_progress.setValue(pct)
+        self._weather_status_label.setText(f"Step {step} / {n_steps}")
+
+    def _on_weather_finished(self, ws):
+        self._weather_running = False
+        self._calc_btn.setEnabled(True)
+
+        if not self._weather_calculated:
+            # generate() was called while worker ran — discard stale result.
+            self._weather_progress.setVisible(False)
+            self._weather_status_label.setText("")
+            return
+
+        self._compositor.set_weather_sim(ws)
+        self.map_view.set_wind_data(ws.sim_wind_u, ws.sim_wind_v, ws.sim_wind_speed)
+        self.layer_bar.set_wind_enabled(True)
+        self.layer_bar.set_alpine_enabled(True)
+        self.layer_bar.set_ice_enabled(True)
+        self.layer_bar.set_biomes_enabled(True)
+        self._weather_progress.setValue(100)
+        self._weather_status_label.setText("Done")
+        self.render()
+
+        if self._weather_rerun_pending:
+            self._run_weather_worker()
 
     # ==========================================================
     # Rendering
@@ -371,11 +581,11 @@ class PlanetUI(QWidget):
 
         img = self._compositor.render_base(
             base_layer=self.layer_bar.base_layer(),
-            curve_editor=self.curve_editor,
             cmap_name=self.layer_bar.cmap_name(),
             clip_sea=self.clip_sea.isChecked(),
             precip_scale_mm=slider_value(self.ws_precip_scale),
             ice_overlay=self._ice_overlay_visible,
+            alpine_overlay=self._alpine_overlay_visible,
         )
 
         self.map_view.set_image(img)
@@ -480,10 +690,10 @@ class PlanetUI(QWidget):
         from PIL import Image
         img = self._compositor.render_base(
             base_layer=self.layer_bar.base_layer(),
-            curve_editor=self.curve_editor,
             cmap_name=self.layer_bar.cmap_name(),
             clip_sea=self.clip_sea.isChecked(),
             precip_scale_mm=slider_value(self.ws_precip_scale),
             ice_overlay=self._ice_overlay_visible,
+            alpine_overlay=self._alpine_overlay_visible,
         )
         Image.fromarray(img).save(filename)

@@ -55,6 +55,17 @@ def perlin3(x, y, z, perm):
                   _grad3(perm[bb + 1], xf - 1.0, yf - 1.0, zf - 1.0), u), v), w)
 
 
+@njit(cache=True)
+def perlin3_grid(xs, ys, zs, perm):
+    """Sample perlin3 over a 2D grid of 3D coordinates. Returns (H, W) array."""
+    H, W = xs.shape
+    out = np.empty((H, W), dtype=np.float64)
+    for r in range(H):
+        for c in range(W):
+            out[r, c] = perlin3(xs[r, c], ys[r, c], zs[r, c], perm)
+    return out
+
+
 def make_permutation(seed):
     rng = np.random.default_rng(seed)
     p = np.arange(256, dtype=np.int32)
