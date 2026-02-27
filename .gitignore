@@ -1,0 +1,7 @@
+#pyc stuff
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# pngs
+*.png
