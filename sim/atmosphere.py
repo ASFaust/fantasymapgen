@@ -208,28 +208,23 @@ def compute_moisture_grid(
     total_static_hum_loss = 0.0  # net humidity lost to static rainout (after reevap)
 
     for _ in range(n_steps):
-        # 1. Advect
-        new_humidity = np.zeros((H, W), dtype=np.float32)
-        np.add.at(new_humidity, (target_y, target_x), humidity)
-        #count = np.zeros((H, W), dtype=np.float32)
-        #np.add.at(count, (target_y, target_x), 1.0)
-        #new_humidity = np.where(count > 0, new_humidity / count, new_humidity)
-
-        # 2. Orographic precipitation
-        orog_precip = orographic_loss * new_humidity
-        net_orog_hum_loss = orog_precip * (1 - reevaporation_factor)
-        new_humidity -= net_orog_hum_loss
-        precip += orog_precip
+        # Orographic loss happens at the source, during ascent
+        orog_precip = orographic_loss * humidity
+        humidity -= orog_precip * (1.0 - reevaporation_factor)
+        precip += orog_precip  # precipitation attributed to source cell (windward slope)
         total_orog_precip   += float(orog_precip.sum())
         total_orog_hum_loss += float(net_orog_hum_loss.sum())
 
-        # 3. Supersaturation check
+        # 1. Advect
+        new_humidity = np.zeros((H, W), dtype=np.float32)
+        np.add.at(new_humidity, (target_y, target_x), humidity)
+        
+        # 3. Supersaturation check - no reevaporation
         excess = np.maximum(0.0, new_humidity - max_sat_target)
-        net_super_hum_loss = excess * (1 - reevaporation_factor)
-        new_humidity -= net_super_hum_loss
+        new_humidity -= excess
         precip += excess
         total_super_precip   += float(excess.sum())
-        total_super_hum_loss += float(net_super_hum_loss.sum())
+        total_super_hum_loss += float(excess.sum())  # reevaporated humidity is not lost
 
         # 4. Static / advective rainout
         static_precip = static_loss * new_humidity
