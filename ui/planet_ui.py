@@ -674,7 +674,25 @@ class PlanetUI(QWidget):
                 "clip_sea":           self.clip_sea.isChecked(),
                 "cmap":               self.layer_bar.cmap_name(),
                 "curve":              [list(p) for p in self.curve_editor._points],
-            }
+            },
+            "weather": {
+                "earth_radius_factor":  slider_value(self.earth_radius_factor),
+                "mountain_height_km":   slider_value(self.mountain_height_km),
+                "sim_resolution":       self.sim_resolution_combo.currentData(),
+                "polar_temp":           slider_value(self.ws_polar_temp),
+                "equatorial_temp":      slider_value(self.ws_equatorial_temp),
+                "lapse_rate":           slider_value(self.ws_lapse_rate),
+                "dt":                   self.ws_dt.value(),
+                "sigma_diffusion":      slider_value(self.ws_sigma_diffusion),
+                "max_transport_km":     slider_value(self.ws_max_transport_km),
+                "total_orog_loss_km":   slider_value(self.ws_total_orog_loss_km),
+                "precip_gamma":         slider_value(self.ws_precip_gamma),
+                "hum_gamma":            slider_value(self.ws_hum_gamma),
+                "precip_hum_ratio":     slider_value(self.ws_precip_hum_ratio),
+                "n_steps":              self.ws_n_steps.value(),
+                "ocean_temp_noise":     slider_value(self.ws_ocean_temp_noise),
+                "precip_scale":         slider_value(self.ws_precip_scale),
+            },
         }
 
     def _apply_preset(self, data: dict):
@@ -702,6 +720,27 @@ class PlanetUI(QWidget):
         if "curve"              in t:
             self.curve_editor._points = [list(p) for p in t["curve"]]
             self.curve_editor.update()
+
+        w = data.get("weather", {})
+        if "earth_radius_factor" in w: set_slider(self.earth_radius_factor,  w["earth_radius_factor"])
+        if "mountain_height_km"  in w: set_slider(self.mountain_height_km,   w["mountain_height_km"])
+        if "sim_resolution"      in w:
+            idx = self.sim_resolution_combo.findData(w["sim_resolution"])
+            if idx >= 0:
+                self.sim_resolution_combo.setCurrentIndex(idx)
+        if "polar_temp"          in w: set_slider(self.ws_polar_temp,        w["polar_temp"])
+        if "equatorial_temp"     in w: set_slider(self.ws_equatorial_temp,   w["equatorial_temp"])
+        if "lapse_rate"          in w: set_slider(self.ws_lapse_rate,        w["lapse_rate"])
+        if "dt"                  in w: self.ws_dt.setValue(w["dt"])
+        if "sigma_diffusion"     in w: set_slider(self.ws_sigma_diffusion,   w["sigma_diffusion"])
+        if "max_transport_km"    in w: set_slider(self.ws_max_transport_km,  w["max_transport_km"])
+        if "total_orog_loss_km"  in w: set_slider(self.ws_total_orog_loss_km, w["total_orog_loss_km"])
+        if "precip_gamma"        in w: set_slider(self.ws_precip_gamma,      w["precip_gamma"])
+        if "hum_gamma"           in w: set_slider(self.ws_hum_gamma,         w["hum_gamma"])
+        if "precip_hum_ratio"    in w: set_slider(self.ws_precip_hum_ratio,  w["precip_hum_ratio"])
+        if "n_steps"             in w: self.ws_n_steps.setValue(w["n_steps"])
+        if "ocean_temp_noise"    in w: set_slider(self.ws_ocean_temp_noise,  w["ocean_temp_noise"])
+        if "precip_scale"        in w: set_slider(self.ws_precip_scale,      w["precip_scale"])
 
     def set_default_preset(self):
         with open(_DEFAULT_PRESET, "w") as f:

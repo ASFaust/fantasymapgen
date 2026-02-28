@@ -20,3 +20,20 @@ terrain:
     - 0.0
   - - 1.0
     - 0.9753086419753086
+weather:
+  earth_radius_factor: 1.0
+  mountain_height_km: 8.0
+  sim_resolution: 256
+  polar_temp: -25.0
+  equatorial_temp: 31.5
+  lapse_rate: 6.5
+  dt: 4.0
+  sigma_diffusion: 2.0
+  max_transport_km: 3661.0
+  total_orog_loss_km: 8.0
+  precip_gamma: 0.91
+  hum_gamma: 0.91
+  precip_hum_ratio: 0.0
+  n_steps: 500
+  ocean_temp_noise: 4.0
+  precip_scale: 8990.0
