@@ -3,81 +3,6 @@ from scipy.ndimage import gaussian_filter
 
 from gen.fast_perlin import make_permutation, perlin3_grid
 
-# ---------------------------------------------------------------------------
-# Optional Numba acceleration for the moisture time-stepping loop.
-# On first import the JIT function is compiled (a few seconds); subsequent
-# runs reuse the on-disk cache (cache=True).  Falls back to pure NumPy if
-# numba is not installed.
-# ---------------------------------------------------------------------------
-try:
-    import numba as _nb
-
-    @_nb.njit(parallel=True, cache=True)
-    def _moisture_step_nb(q, q_new, precip_step,
-                          q_sat, decay,
-                          u_pos, u_neg, v_pos, v_neg,
-                          inv_dx, inv_dx2, inv_dy, inv_dy2,
-                          dt, diff_coef, sim_ocean):
-        """One upwind-advection step (JIT-compiled, parallel over rows).
-
-        Reads *q*, writes into *q_new* and *precip_step* in-place.
-        Uses direct index arithmetic instead of np.roll/concatenate, so
-        no temporary arrays are allocated during the hot loop.
-        """
-        H, W = q.shape
-        for i in _nb.prange(H):
-            i_N = i - 1 if i > 0 else 0
-            i_S = i + 1 if i < H - 1 else H - 1
-            for j in range(W):
-                j_W = j - 1 if j > 0 else W - 1
-                j_E = j + 1 if j < W - 1 else 0
-
-                qc = q[i, j]
-                qW = q[i, j_W]
-                qE = q[i, j_E]
-                qN = q[i_N, j]
-                qS = q[i_S, j]
-                qs = q_sat[i, j]
-
-                # Upwind advection
-                flux_x = (u_pos[i, j] * (qc - qW) +
-                           u_neg[i, j] * (qE - qc)) * inv_dx[i, j]
-                flux_y = (v_pos[i, j] * (qc - qS) +
-                           v_neg[i, j] * (qN - qc)) * inv_dy
-
-                # 5-point diffusion
-                laplacian = ((qE - 2.0 * qc + qW) * inv_dx2[i, j] +
-                             (qN - 2.0 * qc + qS) * inv_dy2)
-
-                q_adv = qc - dt * (flux_x + flux_y) + diff_coef * laplacian
-
-                # Decay → precipitation
-                p = q_adv * (1.0 - decay[i, j])
-                q_val = q_adv * decay[i, j]
-
-                # Supersaturation
-                excess = q_val - qs
-                if excess > 0.0:
-                    p += excess
-                    q_val = qs
-
-                # Clamp and ocean pin
-                if q_val < 0.0:
-                    q_val = 0.0
-                elif q_val > 1.0:
-                    q_val = 1.0
-                if sim_ocean[i, j]:
-                    q_val = qs
-
-                q_new[i, j] = q_val
-                precip_step[i, j] = p
-
-    _HAVE_NUMBA = True
-
-except ImportError:
-    _HAVE_NUMBA = False
-
-
 def compute_base_wind(
     sim_lat: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -222,223 +147,127 @@ def compute_moisture_grid(
     wind_u: np.ndarray,
     wind_v: np.ndarray,
     radius_km: float,
-    temperature: np.ndarray | None = None,
-    sim_time_hours: float = 500.0,
-    diffusion_km2_hr: float = 100.0,
-    orographic_factor: float = 0.5,
-    land_penetration_km: float = 2000.0,
-    max_outflow_fraction: float = 0.8,
-    convergence_threshold: float = 1e-6,
-    progress_cb=None,
+    temperature: np.ndarray,
+    dt: float,
+    reevaporation_factor: float = 0.5,
+    precipitation_factor: float = 0.01,
+    orographic_scale_km: float = 1.0,
+    n_steps: int = 100,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Upwind advection moisture simulation with CFL time stepping.
-
-    Replaces the 8-neighbor CA with a first-order upwind finite-difference
-    scheme.  Moisture is advected strictly along the wind direction without
-    directional leakage to off-wind neighbors.  This, combined with a
-    CFL-derived physical dt, makes inland penetration resolution-independent.
-
-    Each step:
-      1. Upwind advection  — moves moisture along wind
-      2. Diffusion         — small isotropic smoothing (5-point Laplacian)
-      3. Land loss         — exponential decay with e-folding = land_penetration_km
-      4. Orographic loss   — moisture removed when wind pushes air upslope
-      5. Supersaturation   — precipitate excess above q_sat
-      6. Ocean reset       — ocean cells pinned to q_sat
-
-    Parameters
-    ----------
-    sim_ocean           : (H, W) bool   — True where ocean
-    sim_lat             : (H, W) float  — latitude in radians, row 0 = north
-    sim_lon             : (H, W) float  — longitude in radians
-    sim_elevation_km    : (H, W) float  — terrain elevation above sea level [km]
-    wind_u              : (H, W) float  — eastward wind [m/s]
-    wind_v              : (H, W) float  — northward wind [m/s]
-    radius_km           : float         — planetary radius in km
-    temperature         : (H, W) float  — surface temperature in °C, or None
-    sim_time_hours      : float         — total physical simulation time [hours]
-    diffusion_km2_hr    : float         — isotropic diffusion coefficient [km²/hr]
-    orographic_factor   : float         — moisture loss fraction per km elevation gain
-    land_penetration_km : float         — e-folding distance over flat land [km]
-    max_outflow_fraction: float         — (unused, kept for API compat)
-    convergence_threshold: float        — stop if max per-cell |Δq| < this
-
-    Returns
-    -------
-    moisture      : (H, W) float32  — steady-state atmospheric moisture [0, 1]
-    precipitation : (H, W) float32  — precipitation at final step [0, 1], normalized
-                                      so the land maximum = 1.0
-    """
     H, W = sim_lat.shape
+    humidity = np.zeros((H, W), dtype=np.float32)
+    precip = np.zeros((H, W), dtype=np.float32)
 
-    # ------------------------------------------------------------------
-    # 1. Temperature-dependent saturation capacity
-    # ------------------------------------------------------------------
-    if temperature is not None:
-        t_max = float(temperature.max())
-        q_sat = np.exp(0.067 * (temperature - t_max)).astype(np.float64)
-    else:
-        q_sat = np.ones((H, W), dtype=np.float64)
+    # Correct Clausius-Clapeyron: reference at T0=0°C, q_sat0 ~ 0.0038 kg/kg
+    T0 = 273.15  # reference temp in K
+    L = 2.5e6
+    R = 461.5
+    q_sat = 0.0038 * np.exp((L / R) * (1.0 / T0 - 1.0 / (temperature + 273.15)))
+    humidity[sim_ocean] = q_sat[sim_ocean]
+    humidity[~sim_ocean] = 0.0
 
-    # ------------------------------------------------------------------
-    # 2. Grid geometry
-    # ------------------------------------------------------------------
-    lat_col = sim_lat[:, W // 2]
-    dlat = float(np.abs(np.median(np.diff(lat_col))))
-    dlon = float(np.abs(np.median(np.diff(sim_lon[H // 2, :]))))
+    max_saturation = np.zeros_like(humidity)
+    max_saturation[sim_ocean] = q_sat[sim_ocean]
+    max_saturation[~sim_ocean] = q_sat[~sim_ocean] * np.exp(-sim_elevation_km[~sim_ocean] / 8.0)
 
-    dy = radius_km * dlat                                # N-S spacing [km], scalar
-    dx = np.maximum(radius_km * dlon * np.cos(sim_lat),  # E-W spacing [km], (H,W)
-                    dy * 0.25)                            # cap so poles don't strangle CFL
+    dlat = (wind_v * dt) / (radius_km * 1000)
+    dlon = (wind_u * dt) / (radius_km * 1000 * np.cos(sim_lat))
+    target_lat = sim_lat + dlat
+    target_lon = sim_lon + dlon
+    target_lon = (target_lon + np.pi) % (2 * np.pi) - np.pi
+    target_x = ((target_lon + np.pi) / (2 * np.pi) * W).astype(int)
+    target_y = ((target_lat + np.pi / 2) / np.pi * H).astype(int)
+    target_x = np.clip(target_x, 0, W - 1)
+    target_y = np.clip(target_y, 0, H - 1)
+    distance = np.sqrt((dlat * radius_km * 1000)**2 + (dlon * radius_km * 1000 * np.cos(sim_lat))**2)
 
-    # ------------------------------------------------------------------
-    # 3. Wind in km/hr, CFL time step
-    # ------------------------------------------------------------------
-    u_kmh = wind_u * 3.6                                 # eastward [km/hr]
-    v_kmh = wind_v * 3.6                                 # northward [km/hr]
+    print(f"Min distance advected per step: {distance.min():.2f} m")
+    print(f"Max distance advected per step: {distance.max():.2f} m")
+    print(f"Mean distance advected per step: {distance.mean():.2f} m")
+    # compute also in pixel space: how many pixels does the average air parcel move per step?
+    pixel_distance = np.sqrt((target_y - np.arange(H)[:, None])**2 + (target_x - np.arange(W)[None, :])**2)
+    print(f"Min pixel distance advected per step: {pixel_distance.min():.2f} pixels")
+    print(f"Max pixel distance advected per step: {pixel_distance.max():.2f} pixels")
+    print(f"Mean pixel distance advected per step: {pixel_distance.mean():.2f} pixels")
 
-    cfl = 0.45
-    # Full 2D CFL: dt * (|u|/dx + |v|/dy) < 1
-    max_courant = float((np.abs(u_kmh) / dx + np.abs(v_kmh) / dy).max())
-    dt = cfl / max(max_courant, 1e-6)                    # hours
-    n_steps = min(int(np.ceil(sim_time_hours / dt)), 10000)
+    elev_source = sim_elevation_km
+    elev_target = sim_elevation_km[target_y, target_x]
+    elev_gain = np.maximum(0.0, elev_target - elev_source)
+    orographic_loss = 1.0 - np.exp(-elev_gain / orographic_scale_km)
+    distance_km = distance / 1000.0
+    static_loss = precipitation_factor * distance_km
+    max_sat_target = max_saturation[target_y, target_x]
 
-    print(f"Moisture sim: dy={dy:.1f} km, v_max={float(np.sqrt(u_kmh**2+v_kmh**2).max()):.1f} km/h, "
-          f"dt={dt:.2f} hr, n_steps={n_steps}")
+    # --- Accumulators for stats ---
+    total_orog_precip   = 0.0  # precipitation due to orographic lifting
+    total_super_precip  = 0.0  # precipitation due to supersaturation
+    total_static_precip = 0.0  # precipitation due to static/advective rainout
 
-    # ------------------------------------------------------------------
-    # 4. Precompute upwind helpers (static)
-    # ------------------------------------------------------------------
-    u_pos = np.maximum(u_kmh, 0.0)
-    u_neg = np.minimum(u_kmh, 0.0)
-    v_pos = np.maximum(v_kmh, 0.0)   # northward = row-decreasing
-    v_neg = np.minimum(v_kmh, 0.0)   # southward = row-increasing
+    total_orog_hum_loss   = 0.0  # net humidity lost to orographic (after reevap)
+    total_super_hum_loss  = 0.0  # net humidity lost to supersaturation (after reevap)
+    total_static_hum_loss = 0.0  # net humidity lost to static rainout (after reevap)
 
-    inv_dx = 1.0 / dx               # (H, W)
-    inv_dy = 1.0 / dy               # scalar
+    for _ in range(n_steps):
+        # 1. Advect
+        new_humidity = np.zeros((H, W), dtype=np.float32)
+        np.add.at(new_humidity, (target_y, target_x), humidity)
+        #count = np.zeros((H, W), dtype=np.float32)
+        #np.add.at(count, (target_y, target_x), 1.0)
+        #new_humidity = np.where(count > 0, new_humidity / count, new_humidity)
 
-    # Diffusion stability: D*dt*(1/dx² + 1/dy²) < 0.5  (always satisfied
-    # at our CFL because advection is the stiff term, not diffusion)
-    inv_dx2 = inv_dx ** 2
-    inv_dy2 = inv_dy ** 2
+        # 2. Orographic precipitation
+        orog_precip = orographic_loss * new_humidity
+        net_orog_hum_loss = orog_precip * (1 - reevaporation_factor)
+        new_humidity -= net_orog_hum_loss
+        precip += orog_precip
+        total_orog_precip   += float(orog_precip.sum())
+        total_orog_hum_loss += float(net_orog_hum_loss.sum())
 
-    # ------------------------------------------------------------------
-    # 5. Terrain gradient → orographic uplift rate [km/hr]
-    # ------------------------------------------------------------------
-    elev = sim_elevation_km
-    # Central differences, wrapping EW, clamping NS
-    elev_E = np.roll(elev, -1, axis=1)
-    elev_W = np.roll(elev, 1, axis=1)
-    elev_N = np.concatenate([elev[:1], elev[:-1]], axis=0)
-    elev_S = np.concatenate([elev[1:], elev[-1:]], axis=0)
+        # 3. Supersaturation check
+        excess = np.maximum(0.0, new_humidity - max_sat_target)
+        net_super_hum_loss = excess * (1 - reevaporation_factor)
+        new_humidity -= net_super_hum_loss
+        precip += excess
+        total_super_precip   += float(excess.sum())
+        total_super_hum_loss += float(net_super_hum_loss.sum())
 
-    dz_dx = (elev_E - elev_W) / (2.0 * dx)              # [km/km]
-    dz_dy = (elev_N - elev_S) / (2.0 * dy)              # [km/km]
+        # 4. Static / advective rainout
+        static_precip = static_loss * new_humidity
+        net_static_hum_loss = static_precip * (1 - reevaporation_factor)
+        new_humidity -= net_static_hum_loss
+        precip += static_precip
+        total_static_precip   += float(static_precip.sum())
+        total_static_hum_loss += float(net_static_hum_loss.sum())
 
-    # Uplift = wind·∇z (positive when air is pushed upslope)
-    uplift_kmh = np.maximum(0.0, u_kmh * dz_dx + v_kmh * dz_dy)  # [km/hr]
+        humidity = new_humidity
 
-    # ------------------------------------------------------------------
-    # 6. Precompute per-step decay factors (static)
-    # ------------------------------------------------------------------
-    land = (~sim_ocean).astype(np.float64)
-    land_loss_per_km = 1.0 / max(land_penetration_km, 1.0)
-    wind_speed_kmh = np.sqrt(u_kmh ** 2 + v_kmh ** 2)
-    # Minimum effective speed for loss: ensures calm regions still lose
-    # moisture over land (convective precip, radiation cooling)
-    effective_speed = np.maximum(wind_speed_kmh, 1.0)     # km/hr
+    # --- Normalize outputs ---
+    q_ref = 0.622 * np.exp(L * 30.0 / (R * (30.0 + 273.15)))
+    moisture = np.clip(humidity / q_ref, 0.0, 1.0).astype(np.float32)
 
-    land_decay = np.exp(-effective_speed * dt * land_loss_per_km * land)
-    oro_decay  = np.exp(-orographic_factor * uplift_kmh * dt)
-    decay = land_decay * oro_decay
-    decay[sim_ocean] = 1.0                                # no loss over ocean
-
-    # ------------------------------------------------------------------
-    # 7. Main loop
-    # ------------------------------------------------------------------
-    q = np.where(sim_ocean, q_sat, 0.0)
-    diff_coef = diffusion_km2_hr * dt
-
-    if _HAVE_NUMBA:
-        # --- Numba path: JIT-compiled parallel step, double-buffered ---
-        # No temporary arrays are allocated inside the loop; q and q_new
-        # are swapped each step instead of copied.
-        q_new = np.empty_like(q)
-        precip_step = np.zeros((H, W), dtype=np.float64)
-        for step in range(n_steps):
-            _moisture_step_nb(q, q_new, precip_step,
-                              q_sat, decay,
-                              u_pos, u_neg, v_pos, v_neg,
-                              inv_dx, inv_dx2, inv_dy, inv_dy2,
-                              dt, diff_coef, sim_ocean)
-            delta = float(np.max(np.abs(q_new - q)))
-            q, q_new = q_new, q                          # double-buffer swap
-
-            if (step + 1) % max(1, n_steps // 20) == 0 or delta < convergence_threshold:
-                t_cur = (step + 1) * dt
-                print(f"\r  {step+1}/{n_steps} ({t_cur:.0f}/{sim_time_hours:.0f} h) "
-                      f"Δq={delta:.2e}", end="", flush=True)
-                if progress_cb is not None:
-                    progress_cb(step + 1, n_steps)
-            if delta < convergence_threshold:
-                break
-
-    else:
-        # --- NumPy fallback (original algorithm, unchanged) ---
-        precip_step = np.zeros((H, W), dtype=np.float64)
-        for step in range(n_steps):
-            q_W = np.roll(q, 1, axis=1)
-            q_E = np.roll(q, -1, axis=1)
-            q_N = np.concatenate([q[:1], q[:-1]], axis=0)
-            q_S = np.concatenate([q[1:], q[-1:]], axis=0)
-
-            flux_x = (u_pos * (q - q_W) + u_neg * (q_E - q)) * inv_dx
-            flux_y = (v_pos * (q - q_S) + v_neg * (q_N - q)) * inv_dy
-            q_adv = q - dt * (flux_x + flux_y)
-
-            laplacian = ((q_E - 2.0 * q + q_W) * inv_dx2 +
-                         (q_N - 2.0 * q + q_S) * inv_dy2)
-            q_adv += diff_coef * laplacian
-
-            precip_step[:] = q_adv * (1.0 - decay)
-            q_new = q_adv * decay
-            excess = np.maximum(0.0, q_new - q_sat)
-            precip_step += excess
-            q_new -= excess
-
-            q_new = np.clip(q_new, 0.0, 1.0)
-            q_new[sim_ocean] = q_sat[sim_ocean]
-
-            delta = float(np.max(np.abs(q_new - q)))
-            q = q_new
-
-            if (step + 1) % max(1, n_steps // 20) == 0 or delta < convergence_threshold:
-                t_cur = (step + 1) * dt
-                print(f"\r  {step+1}/{n_steps} ({t_cur:.0f}/{sim_time_hours:.0f} h) "
-                      f"Δq={delta:.2e}", end="", flush=True)
-                if progress_cb is not None:
-                    progress_cb(step + 1, n_steps)
-            if delta < convergence_threshold:
-                break
-
-    print()
-    precip = precip_step
-
-    # ------------------------------------------------------------------
-    # 8. Post-process precipitation
-    # ------------------------------------------------------------------
-    precip = gaussian_filter(precip, sigma=2.0)
-
-    land_mask = ~sim_ocean
-    if land_mask.any():
-        land_max = precip[land_mask].max()
-        if land_max > 0.0:
-            precip /= land_max
-
-    moisture = np.clip(q, 0.0, 1.0).astype(np.float32)
-    moisture[sim_ocean] = 1.0
+    land_precip = precip[~sim_ocean]
+    if land_precip.max() > 0:
+        precip = precip / land_precip.max()
     precip = np.clip(precip, 0.0, 1.0).astype(np.float32)
-    precip[sim_ocean] = 1.0
+
+    # --- Print stats ---
+    total_precip = total_orog_precip + total_super_precip + total_static_precip
+    total_hum_loss = total_orog_hum_loss + total_super_hum_loss + total_static_hum_loss
+
+    def pct(part, whole):
+        return 100.0 * part / whole if whole > 0 else 0.0
+
+    print("=== Moisture Grid Stats ===")
+    print(f"  Precipitation breakdown (sum over all cells & steps):")
+    print(f"    Orographic:      {total_orog_precip:12.2f}  ({pct(total_orog_precip,   total_precip):.1f}%)")
+    print(f"    Supersaturation: {total_super_precip:12.2f}  ({pct(total_super_precip,  total_precip):.1f}%)")
+    print(f"    Static/advective:{total_static_precip:12.2f}  ({pct(total_static_precip, total_precip):.1f}%)")
+    print(f"    Total:           {total_precip:12.2f}")
+    print(f"  Net humidity loss breakdown (after reevaporation, sum over all cells & steps):")
+    print(f"    Orographic:      {total_orog_hum_loss:12.2f}  ({pct(total_orog_hum_loss,   total_hum_loss):.1f}%)")
+    print(f"    Supersaturation: {total_super_hum_loss:12.2f}  ({pct(total_super_hum_loss,  total_hum_loss):.1f}%)")
+    print(f"    Static/advective:{total_static_hum_loss:12.2f}  ({pct(total_static_hum_loss, total_hum_loss):.1f}%)")
+    print(f"    Total:           {total_hum_loss:12.2f}")
+    print("===========================")
 
     return moisture, precip

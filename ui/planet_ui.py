@@ -6,7 +6,7 @@ _DEFAULT_PRESET = Path(__file__).parent.parent / "default_preset.yaml"
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QSlider, QVBoxLayout, QHBoxLayout,
-    QSpinBox, QCheckBox, QPushButton, QProgressBar,
+    QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton, QProgressBar,
     QScrollArea, QSizePolicy, QFileDialog, QComboBox, QTabWidget,
     QStackedWidget, QButtonGroup,
 )
@@ -43,14 +43,15 @@ class WeatherWorker(QThread):
             polar_temp=p['polar_temp'],
             equatorial_temp=p['equatorial_temp'],
             lapse_rate=p['lapse_rate'],
-            sim_time_hours=p['sim_time_hours'],
-            diffusion_km2_hr=p['diffusion_km2_hr'],
-            orographic_factor=p['orographic_factor'],
-            land_penetration_km=p['land_penetration_km'],
+            dt=p['dt'],
+            reevaporation_factor=p['reevaporation_factor'],
+            precipitation_factor=p['precipitation_factor'],
+            orographic_scale_km=p['orographic_scale_km'],
+            n_steps=p['n_steps'],
             seed=p['seed'],
             ocean_temp_noise=p['ocean_temp_noise'],
         )
-        ws.run_moisture(progress_cb=lambda s, n: self.progress.emit(s, n))
+        ws.run_moisture()
         self.finished.emit(ws)
 
 
@@ -385,10 +386,29 @@ class PlanetUI(QWidget):
         self.ws_equatorial_temp   = _add("equatorial_temp (°C)",  0.0, 60.0,  27.0,  0.5)
         self.ws_lapse_rate        = _add("lapse_rate (°C/km)",   0.0, 15.0,   6.5,  0.1)
 
-        self.ws_sim_time_hours      = _add("sim_time (hours)",    100.0, 2000.0, 500.0, 50.0)
-        self.ws_diffusion_km2_hr    = _add("diffusion (km²/hr)",    0.0,  500.0, 100.0,  5.0)
-        self.ws_orographic_factor   = _add("orographic_factor",     0.0,    5.0,   0.5,  0.01)
-        self.ws_land_penetration_km = _add("land_penetration (km)",100.0,10000.0,2000.0, 50.0)
+        dt_label = QLabel("dt (seconds)")
+        self.ws_dt = QDoubleSpinBox()
+        self.ws_dt.setRange(1.0, 1e9)
+        self.ws_dt.setDecimals(1)
+        self.ws_dt.setSingleStep(100.0)
+        self.ws_dt.setValue(3600.0)
+        self.ws_dt.valueChanged.connect(self._update_weather_sim)
+        self.weather_layout.addWidget(dt_label)
+        self.weather_layout.addWidget(self.ws_dt)
+        self.ws_reevaporation_factor = _add("reevaporation_factor",        0.0,     1.0,    0.5,   0.01)
+        self.ws_precipitation_factor = _add("precipitation_factor (1/km)", 0.0,     0.1,    0.01,  0.001)
+        self.ws_orographic_scale_km  = _add("orographic_scale (km)",       0.1,     5.0,    1.0,   0.1)
+
+        n_steps_label = QLabel("n_steps: 100")
+        self.ws_n_steps = QSpinBox()
+        self.ws_n_steps.setRange(10, 500)
+        self.ws_n_steps.setValue(100)
+        self.ws_n_steps.valueChanged.connect(
+            lambda v: n_steps_label.setText(f"n_steps: {v}")
+        )
+        self.ws_n_steps.valueChanged.connect(self._update_weather_sim)
+        self.weather_layout.addWidget(n_steps_label)
+        self.weather_layout.addWidget(self.ws_n_steps)
 
         # Ocean temperature noise — breaks zonal symmetry of ice caps
         ocean_noise_label = QLabel("ocean_temp_noise (°C): 4.0")
@@ -492,10 +512,11 @@ class PlanetUI(QWidget):
             polar_temp=slider_value(self.ws_polar_temp),
             equatorial_temp=slider_value(self.ws_equatorial_temp),
             lapse_rate=slider_value(self.ws_lapse_rate),
-            sim_time_hours=slider_value(self.ws_sim_time_hours),
-            diffusion_km2_hr=slider_value(self.ws_diffusion_km2_hr),
-            orographic_factor=slider_value(self.ws_orographic_factor),
-            land_penetration_km=slider_value(self.ws_land_penetration_km),
+            dt=self.ws_dt.value(),
+            reevaporation_factor=slider_value(self.ws_reevaporation_factor),
+            precipitation_factor=slider_value(self.ws_precipitation_factor),
+            orographic_scale_km=slider_value(self.ws_orographic_scale_km),
+            n_steps=self.ws_n_steps.value(),
             seed=self.seed.value(),
             ocean_temp_noise=slider_value(self.ws_ocean_temp_noise),
         )
@@ -526,10 +547,11 @@ class PlanetUI(QWidget):
             'polar_temp':           slider_value(self.ws_polar_temp),
             'equatorial_temp':      slider_value(self.ws_equatorial_temp),
             'lapse_rate':           slider_value(self.ws_lapse_rate),
-            'sim_time_hours':       slider_value(self.ws_sim_time_hours),
-            'diffusion_km2_hr':     slider_value(self.ws_diffusion_km2_hr),
-            'orographic_factor':    slider_value(self.ws_orographic_factor),
-            'land_penetration_km':  slider_value(self.ws_land_penetration_km),
+            'dt':                   self.ws_dt.value(),
+            'reevaporation_factor': slider_value(self.ws_reevaporation_factor),
+            'precipitation_factor': slider_value(self.ws_precipitation_factor),
+            'orographic_scale_km':  slider_value(self.ws_orographic_scale_km),
+            'n_steps':              self.ws_n_steps.value(),
             'seed':                 self.seed.value(),
             'ocean_temp_noise':     slider_value(self.ws_ocean_temp_noise),
         }

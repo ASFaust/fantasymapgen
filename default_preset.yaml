@@ -1,9 +1,9 @@
 terrain:
-  size: 1024
+  size: 256
   seed: 12074
-  octaves: 7
+  octaves: 6
   base_freq: 0.72
-  lacunarity: 1.9900000000000002
+  lacunarity: 2.0
   gain: 0.5
   warp1: 1.11
   warp2: 0.99

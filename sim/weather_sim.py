@@ -18,7 +18,7 @@ class WeatherSim:
     ----------
     heightmap : np.ndarray  (H, W) float32, values in [0, 1]
     lat : np.ndarray        (H, W) float32, latitude in radians [-π/2, π/2]
-    lon : np.ndarray        (H, W) float32, longitude in radians [0, 2π]
+    lon : np.ndarray        (H, W) float32, longitude in radians [-π, π]
     earth_radius_factor : float  multiplier on Earth's radius (6371 km)
     mountain_height_km : float   elevation corresponding to heightmap == 1
     sim_resolution : int         internal sim grid size (e.g. 128, 256, 512, 1024)
@@ -37,10 +37,11 @@ class WeatherSim:
         lapse_rate: float = 6.5,
         polar_temp: float = -25.0,
         equatorial_temp: float = 27.0,
-        sim_time_hours: float = 500.0,
-        diffusion_km2_hr: float = 100.0,
-        orographic_factor: float = 0.5,
-        land_penetration_km: float = 2000.0,
+        dt: float = 3600.0,
+        reevaporation_factor: float = 0.5,
+        precipitation_factor: float = 0.01,
+        orographic_scale_km: float = 1.0,
+        n_steps: int = 100,
         seed: int = 42,
         ocean_temp_noise: float = 4.0,
     ):
@@ -54,10 +55,11 @@ class WeatherSim:
         self.lapse_rate = lapse_rate
         self.polar_temp = polar_temp
         self.equatorial_temp = equatorial_temp
-        self.sim_time_hours = sim_time_hours
-        self.diffusion_km2_hr = diffusion_km2_hr
-        self.orographic_factor = orographic_factor
-        self.land_penetration_km = land_penetration_km
+        self.dt = dt
+        self.reevaporation_factor = reevaporation_factor
+        self.precipitation_factor = precipitation_factor
+        self.orographic_scale_km = orographic_scale_km
+        self.n_steps = n_steps
 
         self.radius_km = EARTH_RADIUS_KM * earth_radius_factor
         self.elevation_km: np.ndarray = np.maximum(0.0, heightmap - sea_level) / (1.0 - sea_level) * mountain_height_km
@@ -148,7 +150,7 @@ class WeatherSim:
             result = np.clip(result, 0.0, None)
         return result
 
-    def run_moisture(self, progress_cb=None) -> None:
+    def run_moisture(self) -> None:
         """Run the upwind advection moisture simulation."""
         m, p = compute_moisture_grid(
             self._sim_ocean, self._sim_lat, self._sim_lon,
@@ -156,11 +158,11 @@ class WeatherSim:
             self._sim_wind_u, self._sim_wind_v,
             self.radius_km,
             temperature=self._sim_temperature,
-            sim_time_hours=self.sim_time_hours,
-            diffusion_km2_hr=self.diffusion_km2_hr,
-            orographic_factor=self.orographic_factor,
-            land_penetration_km=self.land_penetration_km,
-            progress_cb=progress_cb,
+            dt=self.dt,
+            reevaporation_factor=self.reevaporation_factor,
+            precipitation_factor=self.precipitation_factor,
+            orographic_scale_km=self.orographic_scale_km,
+            n_steps=self.n_steps,
         )
         self.sim_moisture = self._upsample(m, ocean_value=1.0)
         self.sim_precipitation = self._upsample(p, ocean_value=1.0)

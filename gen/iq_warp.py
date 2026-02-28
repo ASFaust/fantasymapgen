@@ -65,7 +65,7 @@ def sphere_coords(size):
     u = np.linspace(0, 1, size, endpoint=False)
     v = np.linspace(0, 1, size)
 
-    lon = 2 * np.pi * u
+    lon = np.pi * (2 * u - 1)
     lat = np.pi * (v - 0.5)
 
     lon, lat = np.meshgrid(lon, lat)
