@@ -139,6 +139,122 @@ def compute_ocean_temp_noise(
     return result
 
 
+import numpy as np
+import numba
+
+
+@numba.njit
+def _moisture_loop(
+    humidity,             # (H, W) float32, in-place
+    precip,               # (H, W) float32, in-place
+    sim_ocean,            # (H, W) bool
+    sim_elevation_km,     # (H, W) float32
+    max_saturation,       # (H, W) float32
+    wind_u,               # (H, W) float32, m/s
+    wind_v,               # (H, W) float32, m/s
+    sim_lat,              # (H, W) float32, radians
+    sim_lon,              # (H, W) float32, radians
+    lat_min,              # scalar float — sim_lat[0, 0]
+    lat_range,            # scalar float — sim_lat[-1, 0] - sim_lat[0, 0]
+    lon_min,              # scalar float — sim_lon[0, 0]
+    lon_range,            # scalar float — sim_lon[0, -1] - sim_lon[0, 0]
+    radius_m,             # scalar float — radius_km * 1000
+    dt,                   # scalar float
+    sigma_diffusion,      # scalar float, m/s
+    n_steps,              # int
+    max_transport_km,     # scalar float, e.g. 2000.0 km — controls how much moisture is lost to precipitation during transport 
+    total_orog_loss_km,   # scalar float, e.g. 8.0 km — controls how much moisture is lost to orographic precip during transport over mountains
+    precip_gamma,         
+    hum_gamma,
+    seed,                 # int
+):
+    H = humidity.shape[0]
+    W = humidity.shape[1]
+    np.random.seed(seed)
+    #precip is 0 at the beginning
+    
+    # Phase 1: seed ocean cells to saturation
+    for i in range(H):
+        for j in range(W):
+            if sim_ocean[i, j]:
+                humidity[i, j] = max_saturation[i, j]
+
+    new_humidity = np.zeros_like(humidity)
+    for step in range(n_steps):
+        for i in range(H):
+            for j in range(W):
+                h = humidity[i, j]
+                if h < 1e-12:
+                    continue
+
+                # Noisy wind
+                noise_u = np.random.randn() * sigma_diffusion
+                noise_v = np.random.randn() * sigma_diffusion
+                total_u = wind_u[i, j] + noise_u
+                total_v = wind_v[i, j] + noise_v
+
+                # Target lat/lon
+                cos_lat = np.cos(sim_lat[i, j])
+                if cos_lat < 1e-6:
+                    cos_lat = 1e-6
+
+                t_lat = sim_lat[i, j] + (total_v * dt) / radius_m
+                t_lon = sim_lon[i, j] + (total_u * dt) / (radius_m * cos_lat)
+
+                # Convert to pixel coordinates
+                tr = int((t_lat - lat_min) / lat_range * (H - 1) + 0.5)
+                tc = int((t_lon - lon_min) / lon_range * (W - 1) + 0.5)
+
+                # Sphere-aware wrapping
+                if tr < 0:
+                    tr = -tr
+                    tc = tc + W // 2
+                elif tr >= H:
+                    tr = 2 * H - 1 - tr
+                    tc = tc + W // 2
+                tc = tc % W
+
+                # Clamp in case of extreme overshoot past both poles
+                if tr < 0:
+                    tr = 0
+                elif tr >= H:
+                    tr = H - 1
+                
+                dy_m = (tr - i) * (lat_range / (H - 1)) * radius_m
+                # dx in meters: account for longitude spacing and cos(lat)
+                # handle wraparound for dx
+                dc = tc - j
+                if dc > W // 2:
+                    dc -= W
+                elif dc < -W // 2:
+                    dc += W
+                dx_m = dc * (lon_range / (W - 1)) * radius_m * cos_lat
+                dist_km = np.sqrt(dy_m * dy_m + dx_m * dx_m) / 1000.0
+
+                elevation_gain_km = max(0.0, sim_elevation_km[tr, tc] - sim_elevation_km[i, j])
+
+                transport_eff = np.exp(-dist_km / max_transport_km) #how much is lost to precip during transport
+                #max_transport_km is around ~2000 km, meaning after 2000 km, only about 37% of the original moisture remains, and after 4000 km, only about 14% remains.
+                transport_precip = h * (1.0 - transport_eff)
+
+                orog_eff = np.exp(-elevation_gain_km / total_orog_loss_km) #total orog loss is a float around 8km, 
+                orog_precip = h * (1.0 - orog_eff)
+
+                arrival_hum = h * transport_eff * orog_eff #how much humidity arrives at the target cell
+                supersat_precip = max(0.0, humidity[tr, tc] + arrival_hum - max_saturation[tr, tc]) 
+                new_humidity[tr, tc] += arrival_hum - supersat_precip
+                precip[i, j] = precip_gamma * precip[i, j] + (1 - precip_gamma) * (orog_precip + transport_precip * 0.5)
+                precip[tr, tc] = precip_gamma * precip[tr, tc] + (1 - precip_gamma) * (supersat_precip + transport_precip * 0.5)
+
+        for i in range(H):
+            for j in range(W):
+                if sim_ocean[i, j]:
+                    humidity[i, j] = max_saturation[i, j]                    
+                else:
+                    humidity[i, j] = hum_gamma * humidity[i, j] + new_humidity[i, j] * (1 - hum_gamma)
+                new_humidity[i, j] = 0.0
+
+
 def compute_moisture_grid(
     sim_ocean: np.ndarray,
     sim_lat: np.ndarray,
@@ -149,120 +265,76 @@ def compute_moisture_grid(
     radius_km: float,
     temperature: np.ndarray,
     dt: float,
-    reevaporation_factor: float = 0.5,
-    precipitation_factor: float = 0.01,
-    orographic_scale_km: float = 1.0,
+    sigma_diffusion: float = 2.0,
     n_steps: int = 100,
+    max_transport_km: float = 2000.0,
+    total_orog_loss_km: float = 8.0,
+    precip_gamma: float = 0.5,
+    hum_gamma: float = 0.5,
+    precip_hum_ratio: float = 0.5,
+    seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray]:
     H, W = sim_lat.shape
     humidity = np.zeros((H, W), dtype=np.float32)
     precip = np.zeros((H, W), dtype=np.float32)
 
-    # Correct Clausius-Clapeyron: reference at T0=0°C, q_sat0 ~ 0.0038 kg/kg
-    T0 = 273.15  # reference temp in K
+    # Clausius-Clapeyron saturation
+    T0 = 273.15
     L = 2.5e6
     R = 461.5
-    q_sat = 0.0038 * np.exp((L / R) * (1.0 / T0 - 1.0 / (temperature + 273.15)))
-    humidity[sim_ocean] = q_sat[sim_ocean]
-    humidity[~sim_ocean] = 0.0
+    max_saturation = (
+        0.0038 * np.exp((L / R) * (1.0 / T0 - 1.0 / (temperature + 273.15)))
+    ).astype(np.float32)
+    humidity[sim_ocean] = max_saturation[sim_ocean]
 
-    max_saturation = np.zeros_like(humidity)
-    max_saturation[sim_ocean] = q_sat[sim_ocean]
-    max_saturation[~sim_ocean] = q_sat[~sim_ocean] * np.exp(-sim_elevation_km[~sim_ocean] / 8.0)
+    # Grid geometry
+    lat_min = np.float64(sim_lat[0, 0])
+    lat_range = np.float64(sim_lat[-1, 0] - sim_lat[0, 0])
+    lon_min = np.float64(sim_lon[0, 0])
+    lon_range = np.float64(sim_lon[0, -1] - sim_lon[0, 0])
+    radius_m = np.float64(radius_km * 1000.0)
 
-    dlat = (wind_v * dt) / (radius_km * 1000)
-    dlon = (wind_u * dt) / (radius_km * 1000 * np.cos(sim_lat))
-    target_lat = sim_lat + dlat
-    target_lon = sim_lon + dlon
-    target_lon = (target_lon + np.pi) % (2 * np.pi) - np.pi
-    target_x = ((target_lon + np.pi) / (2 * np.pi) * W).astype(int)
-    target_y = ((target_lat + np.pi / 2) / np.pi * H).astype(int)
-    target_x = np.clip(target_x, 0, W - 1)
-    target_y = np.clip(target_y, 0, H - 1)
-    distance = np.sqrt((dlat * radius_km * 1000)**2 + (dlon * radius_km * 1000 * np.cos(sim_lat))**2)
+    print(f"Grid: {H}x{W}, lat [{np.degrees(sim_lat[0,0]):.1f}°, {np.degrees(sim_lat[-1,0]):.1f}°], "
+          f"lon [{np.degrees(sim_lon[0,0]):.1f}°, {np.degrees(sim_lon[0,-1]):.1f}°]")
+    print(f"max/min wind_u: {wind_u.max():.2f} / {wind_u.min():.2f} m/s")
+    print(f"max/min wind_v: {wind_v.max():.2f} / {wind_v.min():.2f} m/s")
+    print(f"sigma_diffusion: {sigma_diffusion:.2f} m/s")
+    print(f"dt: {dt:.1f} s, n_steps: {n_steps}")
 
-    print(f"Min distance advected per step: {distance.min():.2f} m")
-    print(f"Max distance advected per step: {distance.max():.2f} m")
-    print(f"Mean distance advected per step: {distance.mean():.2f} m")
-    # compute also in pixel space: how many pixels does the average air parcel move per step?
-    pixel_distance = np.sqrt((target_y - np.arange(H)[:, None])**2 + (target_x - np.arange(W)[None, :])**2)
-    print(f"Min pixel distance advected per step: {pixel_distance.min():.2f} pixels")
-    print(f"Max pixel distance advected per step: {pixel_distance.max():.2f} pixels")
-    print(f"Mean pixel distance advected per step: {pixel_distance.mean():.2f} pixels")
+    max_wind = np.sqrt(wind_u**2 + wind_v**2).max()
+    max_travel_km = (max_wind + 3 * sigma_diffusion) * dt / 1000.0
+    print(f"Max possible travel per step (wind + 3σ): {max_travel_km:.1f} km")
 
-    elev_source = sim_elevation_km
-    elev_target = sim_elevation_km[target_y, target_x]
-    elev_gain = np.maximum(0.0, elev_target - elev_source)
-    orographic_loss = 1.0 - np.exp(-elev_gain / orographic_scale_km)
-    distance_km = distance / 1000.0
-    static_loss = precipitation_factor * distance_km
-    max_sat_target = max_saturation[target_y, target_x]
-
-    # --- Accumulators for stats ---
-    total_orog_precip   = 0.0  # precipitation due to orographic lifting
-    total_super_precip  = 0.0  # precipitation due to supersaturation
-    total_static_precip = 0.0  # precipitation due to static/advective rainout
-
-    total_orog_hum_loss   = 0.0  # net humidity lost to orographic (after reevap)
-    total_super_hum_loss  = 0.0  # net humidity lost to supersaturation (after reevap)
-    total_static_hum_loss = 0.0  # net humidity lost to static rainout (after reevap)
-
-    for _ in range(n_steps):
-        # Orographic loss happens at the source, during ascent
-        orog_precip = orographic_loss * humidity
-        humidity -= orog_precip * (1.0 - reevaporation_factor)
-        precip += orog_precip  # precipitation attributed to source cell (windward slope)
-        total_orog_precip   += float(orog_precip.sum())
-        total_orog_hum_loss += float(net_orog_hum_loss.sum())
-
-        # 1. Advect
-        new_humidity = np.zeros((H, W), dtype=np.float32)
-        np.add.at(new_humidity, (target_y, target_x), humidity)
-        
-        # 4. Static / advective rainout
-        static_precip = static_loss * new_humidity
-        net_static_hum_loss = static_precip * (1 - reevaporation_factor)
-        new_humidity -= net_static_hum_loss
-        precip += static_precip
-        total_static_precip   += float(static_precip.sum())
-        total_static_hum_loss += float(net_static_hum_loss.sum())
-
-        # 3. Supersaturation check - no reevaporation
-        excess = np.maximum(0.0, new_humidity - max_sat_target)
-        new_humidity -= excess
-        precip += excess
-        total_super_precip   += float(excess.sum())
-        total_super_hum_loss += float(excess.sum())  # reevaporated humidity is not lost
-
-        humidity = new_humidity
-
-    # --- Normalize outputs ---
-    q_ref = 0.622 * np.exp(L * 30.0 / (R * (30.0 + 273.15)))
-    moisture = np.clip(humidity / q_ref, 0.0, 1.0).astype(np.float32)
+    print("Running moisture simulation...")
+    _moisture_loop(
+        humidity, precip,
+        sim_ocean,
+        sim_elevation_km.astype(np.float32),
+        max_saturation,
+        wind_u.astype(np.float32),
+        wind_v.astype(np.float32),
+        sim_lat.astype(np.float32),
+        sim_lon.astype(np.float32),
+        lat_min, lat_range, lon_min, lon_range,
+        radius_m, np.float64(dt),
+        np.float64(sigma_diffusion),
+        n_steps, 
+        max_transport_km,
+        total_orog_loss_km,
+        precip_gamma,
+        hum_gamma,
+        seed
+    )
+    
 
     land_precip = precip[~sim_ocean]
-    if land_precip.max() > 0:
-        precip = precip / land_precip.max()
-    precip = np.clip(precip, 0.0, 1.0).astype(np.float32)
-
-    # --- Print stats ---
-    total_precip = total_orog_precip + total_super_precip + total_static_precip
-    total_hum_loss = total_orog_hum_loss + total_super_hum_loss + total_static_hum_loss
-
-    def pct(part, whole):
-        return 100.0 * part / whole if whole > 0 else 0.0
-
-    print("=== Moisture Grid Stats ===")
-    print(f"  Precipitation breakdown (sum over all cells & steps):")
-    print(f"    Orographic:      {total_orog_precip:12.2f}  ({pct(total_orog_precip,   total_precip):.1f}%)")
-    print(f"    Supersaturation: {total_super_precip:12.2f}  ({pct(total_super_precip,  total_precip):.1f}%)")
-    print(f"    Static/advective:{total_static_precip:12.2f}  ({pct(total_static_precip, total_precip):.1f}%)")
-    print(f"    Total:           {total_precip:12.2f}")
-    print(f"  Net humidity loss breakdown (after reevaporation, sum over all cells & steps):")
-    print(f"    Orographic:      {total_orog_hum_loss:12.2f}  ({pct(total_orog_hum_loss,   total_hum_loss):.1f}%)")
-    print(f"    Supersaturation: {total_super_hum_loss:12.2f}  ({pct(total_super_hum_loss,  total_hum_loss):.1f}%)")
-    print(f"    Static/advective:{total_static_hum_loss:12.2f}  ({pct(total_static_hum_loss, total_hum_loss):.1f}%)")
-    print(f"    Total:           {total_hum_loss:12.2f}")
-    print("===========================")
-
-    return moisture, precip
+    land_hum = humidity[~sim_ocean]
+    print(f"Land precip: mean {land_precip.mean():.2f}, max {land_precip.max():.2f}")
+    print(f"Land humidity: mean {land_hum.mean():.2f}, max {land_hum.max():.2f}")
+    moisture = np.zeros_like(precip) #(H, W) float32
+    moisture[~sim_ocean] = precip[~sim_ocean] * precip_hum_ratio + humidity[~sim_ocean] * (1 - precip_hum_ratio)
+    moisture[sim_ocean] = moisture[~sim_ocean].mean()  # assign ocean cells the mean land moisture
+    #normalize to [0, 1]
+    moisture /= moisture.max()
+    moisture -= moisture.min()
+    return moisture

@@ -44,10 +44,13 @@ class WeatherWorker(QThread):
             equatorial_temp=p['equatorial_temp'],
             lapse_rate=p['lapse_rate'],
             dt=p['dt'],
-            reevaporation_factor=p['reevaporation_factor'],
-            precipitation_factor=p['precipitation_factor'],
-            orographic_scale_km=p['orographic_scale_km'],
+            sigma_diffusion=p['sigma_diffusion'],
             n_steps=p['n_steps'],
+            max_transport_km=p['max_transport_km'],
+            total_orog_loss_km=p['total_orog_loss_km'],
+            precip_gamma=p['precip_gamma'],
+            hum_gamma=p['hum_gamma'],
+            precip_hum_ratio=p['precip_hum_ratio'],
             seed=p['seed'],
             ocean_temp_noise=p['ocean_temp_noise'],
         )
@@ -386,22 +389,48 @@ class PlanetUI(QWidget):
         self.ws_equatorial_temp   = _add("equatorial_temp (°C)",  0.0, 60.0,  27.0,  0.5)
         self.ws_lapse_rate        = _add("lapse_rate (°C/km)",   0.0, 15.0,   6.5,  0.1)
 
-        dt_label = QLabel("dt (seconds)")
+        dt_label = QLabel("dt (hours)")
         self.ws_dt = QDoubleSpinBox()
-        self.ws_dt.setRange(1.0, 1e9)
-        self.ws_dt.setDecimals(1)
-        self.ws_dt.setSingleStep(100.0)
-        self.ws_dt.setValue(3600.0)
+        self.ws_dt.setRange(0.001, 1000.0)
+        self.ws_dt.setDecimals(3)
+        self.ws_dt.setSingleStep(0.5)
+        self.ws_dt.setValue(1.0)
         self.ws_dt.valueChanged.connect(self._update_weather_sim)
         self.weather_layout.addWidget(dt_label)
         self.weather_layout.addWidget(self.ws_dt)
-        self.ws_reevaporation_factor = _add("reevaporation_factor",        0.0,     1.0,    0.5,   0.01)
-        self.ws_precipitation_factor = _add("precipitation_factor (1/km)", 0.0,     0.1,    0.01,  0.001)
-        self.ws_orographic_scale_km  = _add("orographic_scale (km)",       0.1,     5.0,    1.0,   0.1)
+        self.ws_sigma_diffusion    = _add("sigma_diffusion (m/s)", 0.0, 20.0, 2.0, 0.1)
+
+        max_transport_label = QLabel("max_transport_km: 2000")
+        self.ws_max_transport_km = float_slider(1.0, 10000.0, 10.0)
+        self.ws_max_transport_km.setValue(int((2000.0 - 1.0) / 10.0))
+        self.ws_max_transport_km.valueChanged.connect(
+            lambda: max_transport_label.setText(
+                f"max_transport_km: {_sv(self.ws_max_transport_km):.0f}"
+            )
+        )
+        self.ws_max_transport_km.sliderReleased.connect(self._update_weather_sim)
+        self.weather_layout.addWidget(max_transport_label)
+        self.weather_layout.addWidget(self.ws_max_transport_km)
+
+        orog_loss_label = QLabel("total_orog_loss_km: 8.0")
+        self.ws_total_orog_loss_km = float_slider(0.1, 20.0, 0.1)
+        self.ws_total_orog_loss_km.setValue(int((8.0 - 0.1) / 0.1))
+        self.ws_total_orog_loss_km.valueChanged.connect(
+            lambda: orog_loss_label.setText(
+                f"total_orog_loss_km: {_sv(self.ws_total_orog_loss_km):.1f}"
+            )
+        )
+        self.ws_total_orog_loss_km.sliderReleased.connect(self._update_weather_sim)
+        self.weather_layout.addWidget(orog_loss_label)
+        self.weather_layout.addWidget(self.ws_total_orog_loss_km)
+
+        self.ws_precip_gamma     = _add("precip_gamma",     0.0, 1.0, 0.5, 0.01)
+        self.ws_hum_gamma        = _add("hum_gamma",        0.0, 1.0, 0.5, 0.01)
+        self.ws_precip_hum_ratio = _add("precip_hum_ratio", 0.0, 1.0, 0.5, 0.01)
 
         n_steps_label = QLabel("n_steps: 100")
         self.ws_n_steps = QSpinBox()
-        self.ws_n_steps.setRange(10, 500)
+        self.ws_n_steps.setRange(10, 20000)
         self.ws_n_steps.setValue(100)
         self.ws_n_steps.valueChanged.connect(
             lambda v: n_steps_label.setText(f"n_steps: {v}")
@@ -463,7 +492,7 @@ class PlanetUI(QWidget):
             polar_sharpness=slider_value(self.polar_sharpness),
             backside_strength=slider_value(self.backside_strength),
             backside_sharpness=slider_value(self.backside_sharpness),
-            seam_lon=0.0,
+            seam_lon=-np.pi,  # seam at dateline (lon ±180°)
         )
         self._weather_calculated = False
         self._ice_overlay_visible = False
@@ -482,6 +511,7 @@ class PlanetUI(QWidget):
             land_remapped = self.curve_editor.apply(land_norm)
             arr[land_mask] = sea_level + land_remapped * (1.0 - sea_level)
         self.heightmap = arr
+        self.map_view.set_lat_lon(self._lat, self._lon)
         self.map_view.set_contour_data(self.heightmap)
         self.layer_bar.set_contour_enabled(True)
         self._compositor.set_heightmap(self.heightmap, self._lat, self._lon)
@@ -512,11 +542,14 @@ class PlanetUI(QWidget):
             polar_temp=slider_value(self.ws_polar_temp),
             equatorial_temp=slider_value(self.ws_equatorial_temp),
             lapse_rate=slider_value(self.ws_lapse_rate),
-            dt=self.ws_dt.value(),
-            reevaporation_factor=slider_value(self.ws_reevaporation_factor),
-            precipitation_factor=slider_value(self.ws_precipitation_factor),
-            orographic_scale_km=slider_value(self.ws_orographic_scale_km),
+            dt=self.ws_dt.value() * 3600.0,
+            sigma_diffusion=slider_value(self.ws_sigma_diffusion),
             n_steps=self.ws_n_steps.value(),
+            max_transport_km=slider_value(self.ws_max_transport_km),
+            total_orog_loss_km=slider_value(self.ws_total_orog_loss_km),
+            precip_gamma=slider_value(self.ws_precip_gamma),
+            hum_gamma=slider_value(self.ws_hum_gamma),
+            precip_hum_ratio=slider_value(self.ws_precip_hum_ratio),
             seed=self.seed.value(),
             ocean_temp_noise=slider_value(self.ws_ocean_temp_noise),
         )
@@ -547,11 +580,14 @@ class PlanetUI(QWidget):
             'polar_temp':           slider_value(self.ws_polar_temp),
             'equatorial_temp':      slider_value(self.ws_equatorial_temp),
             'lapse_rate':           slider_value(self.ws_lapse_rate),
-            'dt':                   self.ws_dt.value(),
-            'reevaporation_factor': slider_value(self.ws_reevaporation_factor),
-            'precipitation_factor': slider_value(self.ws_precipitation_factor),
-            'orographic_scale_km':  slider_value(self.ws_orographic_scale_km),
+            'dt':                   self.ws_dt.value() * 3600.0,
+            'sigma_diffusion':      slider_value(self.ws_sigma_diffusion),
             'n_steps':              self.ws_n_steps.value(),
+            'max_transport_km':     slider_value(self.ws_max_transport_km),
+            'total_orog_loss_km':   slider_value(self.ws_total_orog_loss_km),
+            'precip_gamma':         slider_value(self.ws_precip_gamma),
+            'hum_gamma':            slider_value(self.ws_hum_gamma),
+            'precip_hum_ratio':     slider_value(self.ws_precip_hum_ratio),
             'seed':                 self.seed.value(),
             'ocean_temp_noise':     slider_value(self.ws_ocean_temp_noise),
         }

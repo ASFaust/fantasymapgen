@@ -2,7 +2,7 @@ import math
 
 import numpy as np
 from PyQt6.QtCore import Qt, QLineF, QPointF, QRectF, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QTransform
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF, QTransform
 from PyQt6.QtWidgets import QSizePolicy, QWidget
 
 
@@ -60,6 +60,12 @@ class MapViewWidget(QWidget):
         self._drag_start: QPointF | None = None
         self._drag_pan_start: tuple[float, float] = (0.0, 0.0)
 
+        # Distance measurement (right-click drag)
+        self._lat_grid: np.ndarray | None = None
+        self._lon_grid: np.ndarray | None = None
+        self._measure_start_frac: tuple[float, float] | None = None  # (col_frac, row_frac)
+        self._measure_end_frac: tuple[float, float] | None = None
+
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     # ------------------------------------------------------------------
@@ -94,6 +100,10 @@ class MapViewWidget(QWidget):
         self._wind_speed = None
         self.update()
 
+    def set_lat_lon(self, lat: np.ndarray, lon: np.ndarray) -> None:
+        self._lat_grid = lat
+        self._lon_grid = lon
+
     def set_contour_data(self, heightmap: np.ndarray) -> None:
         self._heightmap = heightmap
         self.update()
@@ -124,13 +134,24 @@ class MapViewWidget(QWidget):
             self._drag_start = event.position()
             self._drag_pan_start = (self._pan_x, self._pan_y)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif event.button() == Qt.MouseButton.RightButton:
+            frac = self._widget_frac(event.position())
+            if frac is not None:
+                self._measure_start_frac = frac
+                self._measure_end_frac = None
+                self.update()
 
     def mouseMoveEvent(self, event):
-        if self._drag_start is not None:
+        if self._drag_start is not None and event.buttons() & Qt.MouseButton.LeftButton:
             d = event.position() - self._drag_start
             self._pan_x = self._drag_pan_start[0] + d.x()
             self._pan_y = self._drag_pan_start[1] + d.y()
             self.update()
+        if event.buttons() & Qt.MouseButton.RightButton and self._measure_start_frac is not None:
+            frac = self._widget_frac(event.position(), clamp=True)
+            if frac is not None:
+                self._measure_end_frac = frac
+                self.update()
         self._emit_hover(event.position())
 
     def leaveEvent(self, event):
@@ -151,10 +172,50 @@ class MapViewWidget(QWidget):
         else:
             self.hover.emit(-1.0, -1.0)
 
+    def _widget_frac(self, pos: QPointF, clamp: bool = False) -> tuple[float, float] | None:
+        """Convert widget pixel pos to (col_frac, row_frac). Returns None if out of bounds."""
+        if self._bg is None:
+            return None
+        inv, ok = self._view_transform().inverted()
+        if not ok:
+            return None
+        p = inv.map(pos)
+        col_frac = p.x() / self.width()
+        row_frac = p.y() / self.height()
+        if clamp:
+            return max(0.0, min(1.0, col_frac)), max(0.0, min(1.0, row_frac))
+        if 0 <= col_frac <= 1 and 0 <= row_frac <= 1:
+            return col_frac, row_frac
+        return None
+
+    def _frac_to_widget_pos(self, col_frac: float, row_frac: float) -> QPointF:
+        """Convert image-fraction coords to widget pixel coords."""
+        p = QPointF(col_frac * self.width(), row_frac * self.height())
+        return self._view_transform().map(p)
+
+    def _haversine_km(self, row_frac1: float, col_frac1: float,
+                      row_frac2: float, col_frac2: float) -> float:
+        if self._lat_grid is None:
+            return 0.0
+        lat_min = float(self._lat_grid[0, 0])
+        lat_range = float(self._lat_grid[-1, 0]) - lat_min
+        lon_min = float(self._lon_grid[0, 0])
+        lat1 = lat_min + row_frac1 * lat_range
+        lon1 = lon_min + col_frac1 * 2.0 * math.pi
+        lat2 = lat_min + row_frac2 * lat_range
+        lon2 = lon_min + col_frac2 * 2.0 * math.pi
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+        return 2.0 * math.asin(math.sqrt(min(a, 1.0))) * 6371.0
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start = None
             self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def contextMenuEvent(self, event):
+        event.accept()  # suppress OS context menu so right-drag works cleanly
 
     def mouseDoubleClickEvent(self, event):
         """Double-click resets zoom and pan."""
@@ -194,6 +255,9 @@ class MapViewWidget(QWidget):
 
         if self._wind_visible and self._wind_u is not None:
             self._paint_wind(painter, self.width(), self.height())
+
+        if self._measure_start_frac is not None and self._measure_end_frac is not None:
+            self._paint_ruler(painter)
 
     def bake_wind_overlay(self, img: np.ndarray) -> np.ndarray:
         """Return a copy of img with wind arrows painted at image resolution."""
@@ -371,3 +435,102 @@ class MapViewWidget(QWidget):
 
             if lines:
                 painter.drawLines(lines)
+
+    def _great_circle_fracs(self, col_frac1: float, row_frac1: float,
+                             col_frac2: float, row_frac2: float,
+                             n: int = 64) -> list[tuple[float, float]]:
+        """Return (col_frac, row_frac) points along the great-circle arc."""
+        if self._lat_grid is None:
+            return [(col_frac1, row_frac1), (col_frac2, row_frac2)]
+
+        # Equirectangular forward/inverse using grid corners — no integer snap.
+        lat_min = float(self._lat_grid[0, 0])
+        lat_range = float(self._lat_grid[-1, 0]) - lat_min   # ≈ π
+        lon_min = float(self._lon_grid[0, 0])
+        lon_range = 2.0 * math.pi                            # full planet
+
+        def to_latlon(cf: float, rf: float) -> tuple[float, float]:
+            return lat_min + rf * lat_range, lon_min + cf * lon_range
+
+        def to_frac(lat: float, lon: float) -> tuple[float, float]:
+            lon = lon_min + (lon - lon_min) % lon_range
+            return (lon - lon_min) / lon_range, (lat - lat_min) / lat_range
+
+        lat1, lon1 = to_latlon(col_frac1, row_frac1)
+        lat2, lon2 = to_latlon(col_frac2, row_frac2)
+
+        # Unit vectors on sphere
+        v1 = np.array([math.cos(lat1) * math.cos(lon1),
+                       math.cos(lat1) * math.sin(lon1),
+                       math.sin(lat1)])
+        v2 = np.array([math.cos(lat2) * math.cos(lon2),
+                       math.cos(lat2) * math.sin(lon2),
+                       math.sin(lat2)])
+
+        omega = math.acos(max(-1.0, min(1.0, float(np.dot(v1, v2)))))
+        if omega < 1e-6:
+            return [(col_frac1, row_frac1), (col_frac2, row_frac2)]
+        sin_omega = math.sin(omega)
+
+        pts = []
+        for i in range(n + 1):
+            t = i / n
+            f1 = math.sin((1 - t) * omega) / sin_omega
+            f2 = math.sin(t * omega) / sin_omega
+            v = f1 * v1 + f2 * v2
+            lat = math.asin(max(-1.0, min(1.0, float(v[2]))))
+            lon = math.atan2(float(v[1]), float(v[0]))
+            pts.append(to_frac(lat, lon))
+        return pts
+
+    def _paint_ruler(self, painter: QPainter) -> None:
+        """Draw the distance-measurement geodesic in screen space."""
+        painter.resetTransform()
+
+        arc_fracs = self._great_circle_fracs(*self._measure_start_frac, *self._measure_end_frac)
+        p1 = self._frac_to_widget_pos(*self._measure_start_frac)
+        p2 = self._frac_to_widget_pos(*self._measure_end_frac)
+
+        # Geodesic polyline — split at antimeridian crossings (col_frac jump > 0.5)
+        pen = QPen(QColor(220, 30, 30))
+        pen.setWidthF(2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        segment: list[QPointF] = []
+        prev_cf = None
+        for cf, rf in arc_fracs:
+            if prev_cf is not None and abs(cf - prev_cf) > 0.5:
+                if len(segment) >= 2:
+                    painter.drawPolyline(QPolygonF(segment))
+                segment = []
+            segment.append(self._frac_to_widget_pos(cf, rf))
+            prev_cf = cf
+        if len(segment) >= 2:
+            painter.drawPolyline(QPolygonF(segment))
+
+        # Endpoint dots
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(220, 30, 30))
+        for pt in (p1, p2):
+            painter.drawEllipse(pt, 4.0, 4.0)
+
+        # Distance label near midpoint
+        dist_km = self._haversine_km(
+            self._measure_start_frac[1], self._measure_start_frac[0],
+            self._measure_end_frac[1], self._measure_end_frac[0],
+        )
+        if dist_km >= 1000:
+            label = f"{dist_km / 1000:.2f}k km"
+        elif dist_km >= 10:
+            label = f"{dist_km:.0f} km"
+        else:
+            label = f"{dist_km:.1f} km"
+
+        mid = QPointF((p1.x() + p2.x()) / 2 + 6, (p1.y() + p2.y()) / 2 - 7)
+        painter.setPen(QColor(0, 0, 0, 180))
+        painter.drawText(mid + QPointF(1, 1), label)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(mid, label)

@@ -38,10 +38,13 @@ class WeatherSim:
         polar_temp: float = -25.0,
         equatorial_temp: float = 27.0,
         dt: float = 3600.0,
-        reevaporation_factor: float = 0.5,
-        precipitation_factor: float = 0.01,
-        orographic_scale_km: float = 1.0,
+        sigma_diffusion: float = 2.0,
         n_steps: int = 100,
+        max_transport_km: float = 2000.0,
+        total_orog_loss_km: float = 8.0,
+        precip_gamma: float = 0.5,
+        hum_gamma: float = 0.5,
+        precip_hum_ratio: float = 0.5,
         seed: int = 42,
         ocean_temp_noise: float = 4.0,
     ):
@@ -56,10 +59,14 @@ class WeatherSim:
         self.polar_temp = polar_temp
         self.equatorial_temp = equatorial_temp
         self.dt = dt
-        self.reevaporation_factor = reevaporation_factor
-        self.precipitation_factor = precipitation_factor
-        self.orographic_scale_km = orographic_scale_km
+        self.sigma_diffusion = sigma_diffusion
         self.n_steps = n_steps
+        self.max_transport_km = max_transport_km
+        self.total_orog_loss_km = total_orog_loss_km
+        self.precip_gamma = precip_gamma
+        self.hum_gamma = hum_gamma
+        self.precip_hum_ratio = precip_hum_ratio
+        self.seed = seed
 
         self.radius_km = EARTH_RADIUS_KM * earth_radius_factor
         self.elevation_km: np.ndarray = np.maximum(0.0, heightmap - sea_level) / (1.0 - sea_level) * mountain_height_km
@@ -152,17 +159,21 @@ class WeatherSim:
 
     def run_moisture(self) -> None:
         """Run the upwind advection moisture simulation."""
-        m, p = compute_moisture_grid(
+        moisture = compute_moisture_grid(
             self._sim_ocean, self._sim_lat, self._sim_lon,
             self._sim_elevation_km,
             self._sim_wind_u, self._sim_wind_v,
             self.radius_km,
             temperature=self._sim_temperature,
             dt=self.dt,
-            reevaporation_factor=self.reevaporation_factor,
-            precipitation_factor=self.precipitation_factor,
-            orographic_scale_km=self.orographic_scale_km,
+            sigma_diffusion=self.sigma_diffusion,
             n_steps=self.n_steps,
+            max_transport_km=self.max_transport_km,
+            total_orog_loss_km=self.total_orog_loss_km,
+            precip_gamma=self.precip_gamma,
+            hum_gamma=self.hum_gamma,
+            precip_hum_ratio=self.precip_hum_ratio,
+            seed=self.seed,
         )
-        self.sim_moisture = self._upsample(m, ocean_value=1.0)
-        self.sim_precipitation = self._upsample(p, ocean_value=1.0)
+        self.sim_moisture = self._upsample(moisture, ocean_value=1.0)
+        self.sim_precipitation = self.sim_moisture

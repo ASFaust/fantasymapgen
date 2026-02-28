@@ -1,16 +1,16 @@
 terrain:
-  size: 256
-  seed: 12074
+  size: 512
+  seed: 29613
   octaves: 6
-  base_freq: 0.72
+  base_freq: 1.1500000000000001
   lacunarity: 2.0
   gain: 0.5
-  warp1: 1.11
-  warp2: 0.99
+  warp1: 0.51
+  warp2: 0.54
   ridge: false
   land_percentage: 0.29
-  polar_strength: 0.31
-  polar_sharpness: 5.0
+  polar_strength: 0.28
+  polar_sharpness: 9.08
   backside_strength: 0.33
   backside_sharpness: 5.0
   clip_sea: true
@@ -18,11 +18,5 @@ terrain:
   curve:
   - - 0.0
     - 0.0
-  - - 0.28992628992628994
-    - 0.19753086419753085
-  - - 0.5749385749385749
-    - 0.2839506172839506
-  - - 0.8820638820638821
-    - 0.5061728395061729
   - - 1.0
-    - 1.0
+    - 0.9753086419753086
