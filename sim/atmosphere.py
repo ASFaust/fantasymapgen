@@ -219,13 +219,6 @@ def compute_moisture_grid(
         new_humidity = np.zeros((H, W), dtype=np.float32)
         np.add.at(new_humidity, (target_y, target_x), humidity)
         
-        # 3. Supersaturation check - no reevaporation
-        excess = np.maximum(0.0, new_humidity - max_sat_target)
-        new_humidity -= excess
-        precip += excess
-        total_super_precip   += float(excess.sum())
-        total_super_hum_loss += float(excess.sum())  # reevaporated humidity is not lost
-
         # 4. Static / advective rainout
         static_precip = static_loss * new_humidity
         net_static_hum_loss = static_precip * (1 - reevaporation_factor)
@@ -233,6 +226,13 @@ def compute_moisture_grid(
         precip += static_precip
         total_static_precip   += float(static_precip.sum())
         total_static_hum_loss += float(net_static_hum_loss.sum())
+
+        # 3. Supersaturation check - no reevaporation
+        excess = np.maximum(0.0, new_humidity - max_sat_target)
+        new_humidity -= excess
+        precip += excess
+        total_super_precip   += float(excess.sum())
+        total_super_hum_loss += float(excess.sum())  # reevaporated humidity is not lost
 
         humidity = new_humidity
 
