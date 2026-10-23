@@ -11,6 +11,13 @@ Reference material for the terrain generation, not used by the code yet.
   (-1 on creases, 1 on ridges).
 - **Demonstration**: the `Heightmap()` function, with the parameter values and explanations.
 
+`image_buffer.glsl` is the same Shadertoy's Image buffer, also verbatim: it raymarches the
+heightmap inside a box and shades it (cliffs, snow, grass, trees, drainage from the ridge map,
+water, shadows, a simple atmosphere, ACES tonemapping). It is derived from Fewes'
+https://www.shadertoy.com/view/7ljcRW. It relies on Common-tab helpers that are also not
+included (`boxIntersection`, `GetRay`, `SkyColor`, `Shade`, `F_Schlick`, `Tonemap_ACES`,
+`PhaseRayleigh`/`PhaseMie`, `unpack4`, the material and color constants).
+
 Sources:
 
 - Blog post: https://blog.runevision.com/2026/03/fast-and-gorgeous-erosion-filter.html
@@ -24,3 +31,8 @@ The snippet uses helpers from the Shadertoy's Common tab that are not included h
 The Phacelle noise and erosion functions are copyright (c) 2025 Rune Skovbo Johansen and licensed
 under the Mozilla Public License 2.0 (https://mozilla.org/MPL/2.0/). Under the MPL, those functions
 stay under the MPL in any port, with their copyright notice kept.
+
+`image_buffer.glsl` carries no license header. Code on Shadertoy without an explicit license
+falls under Shadertoy's default, CC BY-NC-SA 3.0 (attribution, non-commercial, share-alike),
+which may apply to it and to the Fewes code it derives from. Check with the authors before
+porting it rather than writing our own renderer.
